@@ -13,13 +13,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -83,10 +84,23 @@ class TestExchangeAdapterContract:
     async def test_subscribe_returns_sub_id(self) -> None:
         """subscribe() 返回订阅 ID"""
         adapter = BinanceExchangeAdapter()
-        # 不需要真实 WebSocket 连接，只需验证接口
-        sub_id = await adapter.subscribe("kline", {"symbol": "BTCUSDT"}, lambda d: None)
-        assert isinstance(sub_id, str)
-        assert len(sub_id) > 0
+        # Mock WebSocket 连接，避免真实网络调用
+        mock_ws = AsyncMock()
+        mock_ws.__aenter__ = AsyncMock(return_value=mock_ws)
+        mock_ws.__aexit__ = AsyncMock(return_value=False)
+        mock_ws.send = AsyncMock()
+        mock_ws.__aiter__ = MagicMock(return_value=iter([]))
+
+        with patch("websockets.connect", return_value=mock_ws):
+            sub_id = await adapter.subscribe("kline", {"symbol": "BTCUSDT"}, lambda d: None)
+            assert isinstance(sub_id, str)
+            assert len(sub_id) > 0
+
+        # 清理 WebSocket 任务
+        if adapter._ws_task and not adapter._ws_task.done():
+            adapter._ws_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await adapter._ws_task
 
     @pytest.mark.asyncio
     async def test_unsubscribe_idempotent(self) -> None:

@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime
 from decimal import Decimal
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -24,6 +22,8 @@ from qps.core.models.market import Bar, FeatureSet
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,8 @@ class FeatureRegistry:
         Returns:
             版本号（格式：feat-<hash>）
         """
-        # 生成基于内容的哈希版本号
-        version = self._generate_version(name, func, params)
+        # 生成基于内容的哈希版本号（包含 input_window）
+        version = self._generate_version(name, func, input_window, params)
 
         registration = FeatureRegistration(
             name=name,
@@ -113,11 +113,12 @@ class FeatureRegistry:
         self,
         name: str,
         func: Callable[..., np.ndarray],
+        input_window: int,
         params: dict[str, Any],
     ) -> str:
         """生成基于内容的版本号
 
-        使用 name + params 哈希 + 函数代码哈希，确保：
+        使用 name + input_window + params 哈希 + 函数代码哈希，确保：
         - 跨进程稳定
         - 相同内容产生相同版本
         - 不同内容产生不同版本
@@ -125,6 +126,7 @@ class FeatureRegistry:
         Args:
             name: 特征名
             func: 特征函数
+            input_window: 输入窗口大小
             params: 特征参数
 
         Returns:
@@ -138,8 +140,8 @@ class FeatureRegistry:
         except (OSError, TypeError):
             source = f"{func.__name__}_{id(func)}"
 
-        # 构建版本内容
-        version_content = f"{name}:{sorted(params.items())}:{source}"
+        # 构建版本内容（包含 input_window）
+        version_content = f"{name}:{input_window}:{sorted(params.items())}:{source}"
 
         # 计算哈希
         hash_obj = hashlib.sha256(version_content.encode("utf-8"))
@@ -245,9 +247,8 @@ class FutureFunctionChecker:
         如果结果与原计算不同，说明使用了未来数据。
         """
         # 此方法需要特征函数可重复调用，实际使用时由 FeatureEngine 内部调用
-        # 这里仅做基础检查
+        # 这里做基础检查：前 input_window-1 个值应该为 NaN（因为没有足够的历史数据）
         if input_window > 1 and len(feature_values) >= input_window:
-            # 前 input_window - 1 个值应该为 NaN（因为没有足够的历史数据）
             for i in range(min(input_window - 1, len(feature_values))):
                 if not np.isnan(feature_values[i]):
                     # 记录警告但不阻断（某些特征确实不需要历史）
@@ -303,12 +304,15 @@ class FutureFunctionChecker:
         Returns:
             True 表示无未来函数
         """
-        if len(bars) < input_window + 10:
+        # 修正边界：测试窗口应足够大以覆盖 input_window + 至少 5 个样本
+        test_size = max(input_window + 10, 20)
+
+        if len(bars) < test_size:
             # 数据太少，无法有效检测
             return True
 
-        # 取最后 20 根 K 线做测试
-        test_bars = bars[-20:]
+        # 取最后 test_size 根 K 线做测试
+        test_bars = bars[-test_size:]
         full_result = func(test_bars, params)
 
         # 逐步计算：每次只用到当前 bar 及之前的数据
@@ -318,15 +322,14 @@ class FutureFunctionChecker:
             result = func(subset, params)
             step_results.append(result[-1] if len(result) > 0 else np.nan)
 
-        # 对比结果
+        # 对比结果：从 input_window 开始检查
         for i in range(input_window, len(step_results)):
-            if not np.isnan(step_results[i]) and not np.isnan(full_result[i]):
-                if abs(step_results[i] - full_result[i]) > 1e-10:
-                    logger.warning(
-                        "检测到潜在未来函数：位置 %d 的逐步计算结果 (%.10f) 与完整计算结果 (%.10f) 不一致",
-                        i, step_results[i], full_result[i],
-                    )
-                    return False
+            if not np.isnan(step_results[i]) and not np.isnan(full_result[i]) and abs(step_results[i] - full_result[i]) > 1e-10:
+                logger.warning(
+                    "检测到潜在未来函数：位置 %d 的逐步计算结果 (%.10f) 与完整计算结果 (%.10f) 不一致",
+                    i, step_results[i], full_result[i],
+                )
+                return False
 
         return True
 
@@ -450,6 +453,14 @@ class FeatureEngine:
                 if not self._checker.check(bars, reg.input_window, values, mode=check_mode):
                     logger.warning(
                         "特征 %s 可能存在未来函数，请检查 input_window 设置",
+                        name,
+                    )
+                # strict 模式下额外调用 validate_no_lookahead
+                if check_mode == "strict" and len(bars) >= reg.input_window + 10 and not FutureFunctionChecker.validate_no_lookahead(
+                    reg.func, bars, reg.params, reg.input_window
+                ):
+                    logger.warning(
+                        "特征 %s 检测到潜在未来函数（validate_no_lookahead）",
                         name,
                     )
 

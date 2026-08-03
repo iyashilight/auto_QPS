@@ -113,10 +113,7 @@ class ExchangeCalendarManager:
             True 表示在维护窗口内
         """
         cal = self._get_or_create_calendar(exchange, ts.date())
-        for brk in cal.breaks:
-            if brk.start <= ts < brk.end:
-                return True
-        return False
+        return any(brk.start <= ts < brk.end for brk in cal.breaks)
 
     def is_trading_time(
         self,

@@ -665,6 +665,16 @@ class BinanceMarketAdapter:
                 raw_data = await self._exchange_adapter.request(
                     "GET", "/fapi/v1/fundingRate", params=params
                 )
+            except BrokerBusinessError as e:
+                # 业务错误：记录日志并重新抛出，与 K 线路径保持一致
+                logger.error(
+                    "资金费率采集失败: %s [%s, %s), 错误: %s",
+                    instrument_id,
+                    start.isoformat(),
+                    end.isoformat(),
+                    e.detail,
+                )
+                raise
             except Exception as e:
                 logger.error("资金费率采集失败: %s, 错误: %s", instrument_id, e)
                 break
@@ -729,6 +739,79 @@ class BinanceMarketAdapter:
         except Exception:
             logger.exception("查询持仓量失败: %s", instrument_id)
             return None
+
+    async def fetch_historical_open_interest(
+        self,
+        instrument_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[OpenInterest]:
+        """采集历史持仓量（自动分页）
+
+        Binance API: /futures/data/openInterestHist
+        每页最多 1000 条，按时间升序返回。
+
+        Args:
+            instrument_id: 内部标的 ID
+            start: 开始时间
+            end: 结束时间
+
+        Returns:
+            OpenInterest 列表（按时间升序）
+        """
+        if not self._connected:
+            raise BrokerNetworkError(detail="Market Adapter 未连接")
+
+        exchange_symbol = _to_exchange_symbol(instrument_id)
+
+        all_oi: list[OpenInterest] = []
+        current_start = start
+
+        page_size = 1000
+
+        while current_start < end:
+            params: dict[str, Any] = {
+                "symbol": exchange_symbol,
+                "period": "5m",  # 固定 5m 间隔
+                "startTime": int(current_start.timestamp() * 1000),
+                "endTime": int(end.timestamp() * 1000),
+                "limit": page_size,
+            }
+
+            try:
+                raw_data = await self._exchange_adapter.request(
+                    "GET", "/futures/data/openInterestHist", params=params
+                )
+            except Exception as e:
+                logger.error("历史持仓量采集失败: %s, 错误: %s", instrument_id, e)
+                break
+
+            if not raw_data or not isinstance(raw_data, list):
+                break
+
+            for item in raw_data:
+                try:
+                    oi = OpenInterest(
+                        instrument_id=instrument_id,
+                        ts=datetime.fromtimestamp(item["timestamp"] / 1000, tz=UTC),
+                        oi_value=Decimal(str(item["sumOpenInterestValue"])),
+                        oi_contracts=Decimal(str(item["sumOpenInterest"])),
+                        exchange_ts=datetime.fromtimestamp(item["timestamp"] / 1000, tz=UTC),
+                    )
+                    all_oi.append(oi)
+                except Exception:
+                    logger.exception("解析历史持仓量数据失败")
+                    continue
+
+            if len(raw_data) < page_size:
+                break
+
+            # 更新下一页起始时间
+            last_item = raw_data[-1]
+            last_ts = datetime.fromtimestamp(last_item["timestamp"] / 1000, tz=UTC)
+            current_start = last_ts + timedelta(minutes=5)
+
+        return sorted(all_oi, key=lambda o: o.ts)
 
     async def fetch_mark_price(
         self,

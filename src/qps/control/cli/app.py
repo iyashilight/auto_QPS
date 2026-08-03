@@ -79,7 +79,7 @@ def data_collect(
     json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
     with_funding: bool = typer.Option(False, "--with-funding", help="同时采集资金费率"),
     with_oi: bool = typer.Option(False, "--with-oi", help="同时采集持仓量"),
-    mode: str = typer.Option("append", "--mode", "-m", help="写入模式: append/overwrite/skip"),
+    mode: str = typer.Option("merge", "--mode", "-m", help="写入模式: merge(合并去重,默认)/overwrite(覆盖)/skip(跳过已有)"),
 ) -> None:
     """历史数据采集（异步任务，进度可查）"""
     from qps.broker.exchange_adapter.binance_exchange_adapter import BinanceExchangeAdapter
@@ -156,11 +156,12 @@ def data_collect(
             # 采集持仓量
             oi_count = 0
             if with_oi:
-                typer.echo(f"📈 采集 {instrument} 持仓量...")
-                oi = await market_adapter.fetch_open_interest(instrument_id)
-                if oi:
-                    oi_count = 1
-                    typer.echo(f"   持仓量: {oi.oi_value}")
+                typer.echo(f"📈 采集 {instrument} 历史持仓量...")
+                oi_history = await market_adapter.fetch_historical_open_interest(instrument_id, start_dt, end_dt)
+                if oi_history:
+                    raw_writer.write_open_interest(symbol, oi_history)
+                    oi_count = len(oi_history)
+                    typer.echo(f"   持仓量: {oi_count} 条")
 
             # 输出结果
             if json_output:

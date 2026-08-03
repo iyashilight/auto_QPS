@@ -12,14 +12,16 @@ import hashlib
 import logging
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
 from qps.core.constants import DataQuality
 from qps.core.errors import DataError
-from qps.core.models.market import Bar, FundingRate
+from qps.core.models.market import Bar, FundingRate, OpenInterest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,7 @@ class RawWriter:
         """写入 K 线数据到 Raw 层
 
         按日期分区，每个分区一个 Parquet 文件。
+        分区路径包含 interval 维度，避免不同周期混入同一文件。
 
         Args:
             symbol: 交易所符号（如 btcusdt-perp）
@@ -118,6 +121,9 @@ class RawWriter:
         """
         if not bars:
             return []
+
+        # 从第一根 K 线获取 interval
+        interval = bars[0].interval
 
         # 按日期分组
         by_date: dict[date, list[Bar]] = {}
@@ -133,7 +139,8 @@ class RawWriter:
         written_files: list[Path] = []
 
         for d, day_bars in sorted(by_date.items()):
-            partition_dir = self._raw_dir / symbol / "klines" / d.isoformat()
+            # 分区路径包含 interval 维度，避免不同周期混入同一文件
+            partition_dir = self._raw_dir / symbol / "klines" / interval / d.isoformat()
             partition_dir.mkdir(parents=True, exist_ok=True)
 
             existing_file = partition_dir / "part-000.parquet"
@@ -143,12 +150,12 @@ class RawWriter:
                     logger.debug("Raw 分区已存在，跳过: %s", existing_file)
                     continue
                 elif mode == "append":
-                    # 追加模式：读取已有数据，合并后去重
+                    # 追加模式：读取已有数据，合并后去重（按 interval + open_time）
                     existing_df = pl.read_parquet(existing_file)
                     new_df = self._bars_to_dataframe(day_bars, data_version)
-                    # 按 open_time 去重，保留最新的
+                    # 按 interval + open_time 去重，保留最新的
                     merged = pl.concat([existing_df, new_df])
-                    merged = merged.sort("open_time").unique(subset=["open_time"], keep="last")
+                    merged = merged.sort(["interval", "open_time"]).unique(subset=["interval", "open_time"], keep="last")
                     merged.write_parquet(existing_file)
                     written_files.append(existing_file)
                     logger.debug("追加 Raw K 线: %s (%d bars)", existing_file, len(merged))
@@ -203,6 +210,60 @@ class RawWriter:
                     "data_version": data_version,
                 }
                 for r in day_rates
+            ]
+            df = pl.DataFrame(rows)
+            df.write_parquet(existing_file)
+            written_files.append(existing_file)
+
+        return written_files
+
+    def write_open_interest(
+        self,
+        symbol: str,
+        oi_list: list[OpenInterest],
+        batch_id: str | None = None,
+    ) -> list[Path]:
+        """写入持仓量到 Raw 层
+
+        Args:
+            symbol: 交易所符号（如 btcusdt）
+            oi_list: OpenInterest 列表
+            batch_id: 批次 ID
+
+        Returns:
+            写入的文件路径列表
+        """
+        if not oi_list:
+            return []
+
+        by_date: dict[date, list[OpenInterest]] = {}
+        for oi in oi_list:
+            d = oi.ts.date()
+            by_date.setdefault(d, []).append(oi)
+
+        if batch_id is None:
+            batch_id = f"{symbol}_oi_{datetime.now(tz=UTC).isoformat()}"
+        data_version = self._make_data_version(batch_id)
+
+        written_files: list[Path] = []
+        for d, day_oi in sorted(by_date.items()):
+            partition_dir = self._raw_dir / symbol / "open_interest" / d.isoformat()
+            partition_dir.mkdir(parents=True, exist_ok=True)
+
+            existing_file = partition_dir / "part-000.parquet"
+            if existing_file.exists():
+                continue
+
+            rows = [
+                {
+                    "instrument_id": o.instrument_id,
+                    "ts": o.ts.isoformat(),
+                    "oi_value": str(o.oi_value),
+                    "oi_contracts": str(o.oi_contracts) if o.oi_contracts else None,
+                    "exchange_ts": o.exchange_ts.isoformat() if o.exchange_ts else None,
+                    "data_version": data_version,
+                }
+                for o in day_oi
             ]
             df = pl.DataFrame(rows)
             df.write_parquet(existing_file)
@@ -452,8 +513,10 @@ class Normalizer:
                 ]
                 df = pl.DataFrame(rows)
                 if mode == "append" and out_path.exists():
+                    # 追加模式也要去重（按 open_time）
                     existing_df = pl.read_parquet(out_path)
                     df = pl.concat([existing_df, df])
+                    df = df.sort("open_time").unique(subset=["open_time"], keep="last")
                 df.write_parquet(out_path)
                 last_path = out_path
                 logger.debug("写入 Normalized K 线: %s (%d bars)", out_path, len(year_bars))
