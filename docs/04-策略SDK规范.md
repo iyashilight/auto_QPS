@@ -196,15 +196,20 @@ class TrendBreakout(BaseStrategy):
 
 | 检查项 | 规则 |
 | --- | --- |
-| import 白名单 | 只允许 `numpy`、`polars`、`qps.core.models`、`qps.core.sdk` 及标准库安全子集（`math`, `statistics`, `datetime`, `typing`, `dataclasses`） |
+| import 白名单 | 只允许 `numpy`、`polars`、`qps.core.models`、`qps.core.sdk` 及标准库安全子集（`math`, `statistics`, `datetime`, `typing`, `dataclasses`, `__future__`） |
 | 网络 | 禁止 `socket`、`http`、`websocket`、`requests`、`httpx`、`aiohttp` 相关 import |
 | 文件 | 禁止 `open()`、`pathlib` 写操作、`os` 写操作 |
 | 进程/线程 | 禁止 `threading`、`multiprocessing`、`subprocess`、`os.fork` |
 | 执行 | 禁止 `eval`、`exec`、`compile`、`__import__` 动态调用 |
 | 交易句柄 | 禁止 import 任何 `qps.trading.*`、`qps.broker.*`（源码 AST 检查） |
 | 睡眠/时钟 | 禁止 `time.sleep`；`time.time` 使用告警（应使用 ctx 注入时间） |
+| `runtime_constraints.allow_imports` | 声明额外允许的模块，与默认白名单求并集 |
 
-实现位置：`qps/research/registry.py` 或独立 `qps/core/sandbox.py`（AST 静态分析 + import 钩子）。启动时检查失败 = 启动失败并返回原因，不允许带病运行。
+**特殊放行规则**：
+- `from __future__ import annotations` 必须放行（策略代码必需）；
+- 策略包内部相对导入（如 `from <strategy_id>.strategy import Strategy`）放行。
+
+实现位置：`qps/core/sandbox.py`（AST 静态分析 + import 钩子）。启动时检查失败 = 启动失败并返回原因，不允许带病运行。
 
 ## 7. 参数 schema 规范
 

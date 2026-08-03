@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from qps.core.sdk.context import StrategyContext
+if TYPE_CHECKING:
+    from qps.core.sdk.context import StrategyContext
 
 
 class BaseStrategy(ABC):
@@ -63,7 +64,7 @@ class BaseStrategy(ABC):
         """
         ...
 
-    def on_tick(self, ctx: StrategyContext, tick: Any) -> None:
+    def on_tick(self, ctx: StrategyContext, tick: Any) -> None:  # noqa: B027
         """逐笔成交回调（可选）
 
         Args:
@@ -76,7 +77,7 @@ class BaseStrategy(ABC):
         """
         pass
 
-    def on_funding(self, ctx: StrategyContext, funding: Any) -> None:
+    def on_funding(self, ctx: StrategyContext, funding: Any) -> None:  # noqa: B027
         """资金费率回调（可选）
 
         Args:
@@ -89,7 +90,7 @@ class BaseStrategy(ABC):
         """
         pass
 
-    def on_oi(self, ctx: StrategyContext, oi: Any) -> None:
+    def on_oi(self, ctx: StrategyContext, oi: Any) -> None:  # noqa: B027
         """持仓量回调（可选）
 
         Args:

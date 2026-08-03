@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, ClassVar
 
 from qps.core.constants import (
     Action,
@@ -40,7 +41,7 @@ class IntentBuilder:
     """
 
     # 白名单字段（策略可填写的字段）
-    WHITELISTED_FIELDS = {
+    WHITELISTED_FIELDS: ClassVar[set[str]] = {
         "direction",
         "action",
         "quantity",
@@ -214,7 +215,6 @@ class IntentBuilder:
                 field="reason_tags",
             )
 
-        import re
         pattern = re.compile(r"^[a-z0-9_]+$")
         for tag in tags:
             if not isinstance(tag, str) or not pattern.match(tag):

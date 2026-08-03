@@ -158,19 +158,27 @@ class StrategyRegistry:
             return existing
 
         # 2. 静态检查
-        sandbox_result = self._sandbox.check_code(code_pack.code_content)
+        sandbox_result = self._sandbox.check(code_pack.code_content)
         if not sandbox_result.passed:
             raise DataError(
                 detail=f"静态检查失败: {json.dumps(sandbox_result.to_dict())}",
             )
 
-        # 3. 获取或创建策略主记录
+        # 3. params_schema 校验
+        from qps.research.yaml_parser import validate_params
+
+        try:
+            validate_params({}, code_pack.params_schema)
+        except Exception as e:
+            raise DataError(detail=f"params_schema 校验失败: {e}") from e
+
+        # 4. 获取或创建策略主记录
         self._ensure_strategy(code_pack.strategy_id)
 
-        # 4. 获取下一个版本号
+        # 5. 获取下一个版本号
         version_no = self._next_version_no(code_pack.strategy_id)
 
-        # 5. 插入版本记录
+        # 6. 插入版本记录
         conn = self._get_connection()
         try:
             now = datetime.now(UTC).isoformat()

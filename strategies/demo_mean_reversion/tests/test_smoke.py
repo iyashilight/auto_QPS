@@ -1,9 +1,18 @@
-"""冒烟测试 - 演示均值回归策略"""
+"""冒烟测试 - 演示均值回归策略
+
+测试：
+- 初始化
+- feature 缓存未命中跳过信号
+- INTENT_CREATED 事件捕获
+- 状态恢复（ctx.state）
+"""
 
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 # 确保可以导入策略模块
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -46,64 +55,13 @@ def test_initialize():
     assert True  # 初始化不应抛异常
 
 
-def test_on_bar_no_signal_with_insufficient_data():
-    """测试数据不足时不产生信号"""
-    strategy = Strategy()
-    ctx = StrategyContext(
-        strategy_id="demo_mean_reversion",
-        version_no=1,
-        deployment_id="dep_test",
-        params={"lookback": 50, "entry_z": 2.0, "exit_z": 0.5, "position_size": 0.1},
-        instruments=["BTC-USDT-PERP"],
-        interval="5m",
-    )
-    strategy.initialize(ctx)
+def test_feature_cache_miss_skips_signal():
+    """测试特征缓存未命中时跳过信号"""
+    events_captured: list[dict[str, Any]] = []
 
-    # 只发送少量数据
-    for i in range(10):
-        bar = make_bar(67000.0 + i * 100)
-        strategy.on_bar(ctx, bar)
+    def event_bus(data: dict[str, Any]) -> None:
+        events_captured.append(data)
 
-    # 不应有持仓
-    assert strategy._position_side is None
-
-
-def test_on_bar_generates_intent():
-    """测试 K 线回调产生意图"""
-    strategy = Strategy()
-    ctx = StrategyContext(
-        strategy_id="demo_mean_reversion",
-        version_no=1,
-        deployment_id="dep_test",
-        params={"lookback": 20, "entry_z": 1.5, "exit_z": 0.5, "position_size": 0.1},
-        instruments=["BTC-USDT-PERP"],
-        interval="5m",
-    )
-    strategy.initialize(ctx)
-
-    # 生成足够多的数据，并制造一个明显的偏离
-    base_price = 67000.0
-    bars = []
-
-    # 先发送正常波动的数据
-    for i in range(25):
-        price = base_price + (i % 5) * 50  # 小幅度波动
-        bars.append(make_bar(price))
-
-    # 发送一个大幅偏离的数据（负向偏离）
-    bars.append(make_bar(base_price - 1000))
-
-    # 处理所有 bar
-    for bar in bars:
-        strategy.on_bar(ctx, bar)
-
-    # 应该检测到开仓信号
-    # 注意：由于我们没有实际的事件总线，这里只验证状态更新
-    assert "last_z_score" in ctx.state
-
-
-def test_feature_cache_miss_handling():
-    """测试特征缓存未命中时的处理"""
     strategy = Strategy()
     ctx = StrategyContext(
         strategy_id="demo_mean_reversion",
@@ -113,25 +71,101 @@ def test_feature_cache_miss_handling():
         instruments=["BTC-USDT-PERP"],
         interval="5m",
         feature_pipeline=None,  # 模拟缓存未命中
+        event_bus=event_bus,
     )
     strategy.initialize(ctx)
 
-    # 特征返回空值时，策略应跳过信号
-    result = ctx.feature("binance-btc-usdt-perp", "returns")
-    assert result is None  # 缓存未命中返回 None
+    # 发送一根 K 线
+    bar = make_bar(67000.0)
+    strategy.on_bar(ctx, bar)
+
+    # 特征缓存未命中，不应产生任何意图
+    assert len(events_captured) == 0
+    # 验证日志中有缓存未命中的记录
+    logs = ctx.get_logs()
+    assert any("特征缓存未命中" in log["message"] for log in logs)
+
+
+def test_emit_intent_via_event_bus():
+    """测试通过 event_bus 捕获 INTENT_CREATED"""
+    events_captured: list[dict[str, Any]] = []
+
+    def event_bus(data: dict[str, Any]) -> None:
+        events_captured.append(data)
+
+    # 创建一个返回正常特征值的 pipeline
+    def feature_pipeline(instrument_id: str, names: list[str]) -> dict[str, float]:
+        return {"returns": -0.03, "realized_vol_20": 0.02}
+
+    strategy = Strategy()
+    ctx = StrategyContext(
+        strategy_id="demo_mean_reversion",
+        version_no=1,
+        deployment_id="dep_test",
+        params={"lookback": 50, "entry_z": 2.0, "exit_z": 0.5, "position_size": 0.1},
+        instruments=["BTC-USDT-PERP"],
+        interval="5m",
+        feature_pipeline=feature_pipeline,
+        event_bus=event_bus,
+    )
+    strategy.initialize(ctx)
+
+    # 发送一根 K 线（Z-Score = -0.03/0.02 = -1.5，绝对值 >= entry_z=2.0? 不满足）
+    # 让我们用更极端的值
+    def extreme_pipeline(instrument_id: str, names: list[str]) -> dict[str, float]:
+        return {"returns": -0.05, "realized_vol_20": 0.02}  # Z-Score = -2.5
+
+    ctx._feature_pipeline = extreme_pipeline
+    bar = make_bar(67000.0)
+    strategy.on_bar(ctx, bar)
+
+    # 应该产生开仓意图
+    assert len(events_captured) >= 1
+    intent = events_captured[0]["intent"]
+    assert intent["direction"] == "LONG"  # 负向偏离，做多
+    assert intent["action"] == "OPEN"
+    assert intent["order_type"] == "MARKET"
+    assert "quantity" in intent
+
+
+def test_state_persistence_across_callbacks():
+    """测试跨回调状态持久化（ctx.state）"""
+    strategy = Strategy()
+    ctx = StrategyContext(
+        strategy_id="demo_mean_reversion",
+        version_no=1,
+        deployment_id="dep_test",
+        params={"lookback": 50, "entry_z": 2.0, "exit_z": 0.5, "position_size": 0.1},
+        instruments=["BTC-USDT-PERP"],
+        interval="5m",
+    )
+    strategy.initialize(ctx)
+
+    # 初始状态应为空持仓
+    assert ctx.state.get("position_side") is None
+
+    # 保存状态
+    saved = ctx.save_state()
+    assert saved["position_side"] is None
+
+    # 模拟重启后恢复
+    ctx.restore_state({"position_side": "LONG", "entry_price": "67000"})
+    assert ctx.state["position_side"] == "LONG"
+    # entry_price 在 state 中存储为字符串，需要转换
+    assert str(ctx.state["entry_price"]) == "67000"
 
 
 if __name__ == "__main__":
     test_initialize()
     print("✅ test_initialize passed")
 
-    test_on_bar_no_signal_with_insufficient_data()
-    print("✅ test_on_bar_no_signal_with_insufficient_data passed")
+    test_feature_cache_miss_skips_signal()
+    print("✅ test_feature_cache_miss_skips_signal passed")
 
-    test_on_bar_generates_intent()
-    print("✅ test_on_bar_generates_intent passed")
+    test_emit_intent_via_event_bus()
+    print("✅ test_emit_intent_via_event_bus passed")
 
-    test_feature_cache_miss_handling()
-    print("✅ test_feature_cache_miss_handling passed")
+    test_state_persistence_across_callbacks()
+    print("✅ test_state_persistence_across_callbacks passed")
 
     print("\n🎉 所有测试通过!")

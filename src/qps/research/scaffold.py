@@ -53,7 +53,7 @@ from qps.core.sdk import BaseStrategy, StrategyContext
 from qps.core.models import Bar
 
 
-class TrendStrategy(BaseStrategy):
+class Strategy(BaseStrategy):
     """通道突破趋势策略"""
 
     def initialize(self, ctx: StrategyContext) -> None:
@@ -116,7 +116,7 @@ from qps.core.sdk import BaseStrategy, StrategyContext
 from qps.core.models import Bar
 
 
-class MeanReversionStrategy(BaseStrategy):
+class Strategy(BaseStrategy):
     """均值回归策略"""
 
     def initialize(self, ctx: StrategyContext) -> None:
@@ -172,7 +172,7 @@ from qps.core.sdk import BaseStrategy, StrategyContext
 from qps.core.models import Bar
 
 
-class GridStrategy(BaseStrategy):
+class Strategy(BaseStrategy):
     """网格交易策略"""
 
     def initialize(self, ctx: StrategyContext) -> None:
@@ -197,7 +197,7 @@ class StrategyScaffold:
         """初始化
 
         Args:
-            strategies_dir: 策略目录路径
+            strategies_dir: 策略目录路径（应为仓库根目录下的 strategies/）
         """
         self.strategies_dir = Path(strategies_dir)
 
@@ -290,7 +290,7 @@ class StrategyScaffold:
             },
         }
 
-        return yaml_lib.dump(yaml_dict, allow_unicode=True, sort_keys=False)
+        return str(yaml_lib.dump(yaml_dict, allow_unicode=True, sort_keys=False))
 
     def _generate_test(self, strategy_id: str, template_data: dict[str, Any]) -> str:
         """生成冒烟测试模板"""

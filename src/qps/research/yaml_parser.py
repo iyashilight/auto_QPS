@@ -139,7 +139,7 @@ class ParamSchemaValidator:
 
     def _check_type(self, name: str, value: Any, expected_type: str) -> str | None:
         """检查类型"""
-        type_map = {
+        type_map: dict[str, type | tuple[type, ...]] = {
             "integer": int,
             "number": (int, float),
             "string": str,

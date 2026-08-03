@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, MutableMapping
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from qps.core.models.account import Position
-from qps.core.models.market import Bar
+if TYPE_CHECKING:
+    from qps.core.models.account import Position
+    from qps.core.models.market import Bar
 
 
 class MarketRegimeView:
@@ -348,7 +349,7 @@ class StrategyContext:
             "message": message,
             "strategy_id": self._strategy_id,
             "deployment_id": self._deployment_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             **extra,
         }
         self._log_buffer.append(entry)

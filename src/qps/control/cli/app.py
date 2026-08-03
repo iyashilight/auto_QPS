@@ -572,8 +572,9 @@ def strategy_create(
     name: str | None = typer.Option(None, "--name", help="显示名（可选）"),
     instruments: str | None = typer.Option(None, "--instruments", help="标的列表，逗号分隔（如 BTC-USDT-PERP,ETH-USDT-PERP）"),
 ) -> None:
-    """创建策略（脚手架生成）"""
+    """创建策略（脚手架生成 + 入库）"""
     from qps.infra.config import Config
+    from qps.research.registry import StrategyCodePack, StrategyRegistry
     from qps.research.scaffold import StrategyScaffold
 
     # 验证模板
@@ -587,9 +588,10 @@ def strategy_create(
     if instruments:
         instrument_list = [inst.strip() for inst in instruments.split(",")]
 
-    # 获取数据目录
+    # 获取目录（仓库根 strategies/）
     config = Config()
-    strategies_dir = config.data_dir / "strategies"
+    # 使用 data_dir 的父目录作为项目根目录
+    strategies_dir = config.data_dir.parent / "strategies"
 
     # 生成脚手架
     scaffold = StrategyScaffold(strategies_dir)
@@ -603,6 +605,30 @@ def strategy_create(
         typer.echo(f"✅ 策略创建成功: {strategy_id}")
         typer.echo(f"   目录: {strategy_dir}")
         typer.echo(f"   模板: {template}")
+
+        # 读取生成文件并入库
+        code_content = (strategy_dir / "strategy.py").read_text(encoding="utf-8")
+        yaml_content = (strategy_dir / "strategy.yaml").read_text(encoding="utf-8")
+
+        import yaml as yaml_lib
+        yaml_data = yaml_lib.safe_load(yaml_content)
+
+        code_pack = StrategyCodePack(
+            strategy_id=strategy_id,
+            code_ref=f"local:{strategy_id}",
+            code_content=code_content,
+            params_schema=yaml_data.get("params_schema", {}),
+            data_dependencies=[],
+            feature_dependencies=yaml_data.get("features", []),
+            runtime_constraints=yaml_data.get("runtime_constraints", {}),
+        )
+
+        db_path = config.data_dir / "meta.db"
+        registry = StrategyRegistry(db_path)
+        version_info = asyncio.run(registry.save_version(code_pack))
+
+        typer.echo(f"   版本号: {version_info['version_no']}")
+        typer.echo(f"   内容哈希: {version_info['content_hash']}")
         typer.echo("")
         typer.echo("下一步：")
         typer.echo(f"   1. 编辑 {strategy_dir}/strategy.py 实现策略逻辑")
@@ -696,9 +722,11 @@ def strategy_promote(
     evidence: str | None = typer.Option(None, "--evidence", help="证据 ID 列表（逗号分隔）"),
     confirm: bool = typer.Option(False, "--confirm", help="确认操作"),
 ) -> None:
-    """策略状态提升（需门禁证据）"""
+    """策略状态提升（需门禁证据）
+
+    注意：完整生命周期管理由 M4 LifecycleManagerPort 实现，当前为占位提示。
+    """
     from qps.infra.config import Config
-    from qps.research.registry import StrategyRegistry
 
     config = Config()
     db_path = config.data_dir / "meta.db"
@@ -731,14 +759,10 @@ def strategy_promote(
         typer.echo("请使用 --confirm 参数确认操作", err=True)
         raise typer.Exit(code=1)
 
-    registry = StrategyRegistry(db_path)
-
-    try:
-        # TODO: 实现生命周期管理
-        typer.echo(f"✅ 策略 {strategy_id} 状态已更新为 {to_status}")
-    except Exception as e:
-        typer.echo(f"❌ 操作失败: {e}", err=True)
-        raise typer.Exit(code=1) from e
+    # 诚实的未实现提示
+    typer.echo(f"ℹ️  策略 {strategy_id} 状态提升到 {to_status}")
+    typer.echo("   ⚠️  完整生命周期管理由 M4 LifecycleManagerPort 实现（待开发）")
+    typer.echo("   当前版本仅做占位提示，未实际执行状态迁移")
 
 
 # ── trade 子命令 ─────────────────────────────────────────

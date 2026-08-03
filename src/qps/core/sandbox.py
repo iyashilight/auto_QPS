@@ -100,6 +100,8 @@ ALLOWED_MODULES = {
     "enum",
     "uuid",
     "hashlib",
+    # __future__ 必须放行（策略代码必需）
+    "__future__",
     # qps 核心模块
     "qps.core.models",
     "qps.core.sdk",
@@ -118,8 +120,9 @@ FORBIDDEN_FUNCTIONS = {
 class ImportChecker(ast.NodeVisitor):
     """Import 检查器"""
 
-    def __init__(self, result: SandboxResult) -> None:
+    def __init__(self, result: SandboxResult, allowed_modules: set[str]) -> None:
         self.result = result
+        self.allowed_modules = allowed_modules
 
     def visit_Import(self, node: ast.Import) -> None:
         """检查 import 语句"""
@@ -132,7 +135,7 @@ class ImportChecker(ast.NodeVisitor):
                     line=node.lineno,
                     column=node.col_offset,
                 ))
-            elif module_name not in ALLOWED_MODULES and not alias.name.startswith("qps.core"):
+            elif module_name not in self.allowed_modules and not alias.name.startswith("qps.core"):
                 # 非白名单且非 qps.core 子模块
                 self.result.add_violation(SandboxViolation(
                     rule_id="UNAUTHORIZED_IMPORT",
@@ -154,7 +157,7 @@ class ImportChecker(ast.NodeVisitor):
                     line=node.lineno,
                     column=node.col_offset,
                 ))
-            elif module_name not in ALLOWED_MODULES and not node.module.startswith("qps.core"):
+            elif module_name not in self.allowed_modules and not node.module.startswith("qps.core"):
                 self.result.add_violation(SandboxViolation(
                     rule_id="UNAUTHORIZED_IMPORT",
                     message=f"未授权导入模块: {node.module}",
@@ -185,15 +188,14 @@ class CallChecker(ast.NodeVisitor):
                         line=node.lineno,
                         column=node.col_offset,
                     ))
-        elif isinstance(node.func, ast.Name):
+        elif isinstance(node.func, ast.Name) and node.func.id in ("eval", "exec", "compile"):
             # func() 形式
-            if node.func.id in ("eval", "exec", "compile"):
-                self.result.add_violation(SandboxViolation(
-                    rule_id="FORBIDDEN_FUNCTION",
-                    message=f"禁止调用函数: {node.func.id}",
-                    line=node.lineno,
-                    column=node.col_offset,
-                ))
+            self.result.add_violation(SandboxViolation(
+                rule_id="FORBIDDEN_FUNCTION",
+                message=f"禁止调用函数: {node.func.id}",
+                line=node.lineno,
+                column=node.col_offset,
+            ))
         self.generic_visit(node)
 
 
@@ -233,16 +235,40 @@ class FileAccessChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def check_code(source: str) -> SandboxResult:
+class MetaPathChecker(ast.NodeVisitor):
+    """检查 __import__ 动态调用"""
+
+    def __init__(self, result: SandboxResult) -> None:
+        self.result = result
+
+    def visit_Call(self, node: ast.Call) -> None:
+        """检查 __import__ 调用"""
+        if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+            self.result.add_violation(SandboxViolation(
+                rule_id="DYNAMIC_IMPORT",
+                message="禁止使用 __import__ 动态导入",
+                line=node.lineno,
+                column=node.col_offset,
+            ))
+        self.generic_visit(node)
+
+
+def check_code(source: str, allowed_modules: set[str] | None = None) -> SandboxResult:
     """检查源代码
 
     Args:
         source: Python 源代码字符串
+        allowed_modules: 额外允许的模块集合
 
     Returns:
         检查结果
     """
     result = SandboxResult()
+
+    # 合并允许的模块
+    merged_allowed = ALLOWED_MODULES.copy()
+    if allowed_modules:
+        merged_allowed.update(allowed_modules)
 
     try:
         tree = ast.parse(source)
@@ -255,19 +281,21 @@ def check_code(source: str) -> SandboxResult:
         return result
 
     # 运行所有检查器
-    ImportChecker(result).visit(tree)
+    ImportChecker(result, merged_allowed).visit(tree)
     CallChecker(result).visit(tree)
     NameChecker(result).visit(tree)
     FileAccessChecker(result).visit(tree)
+    MetaPathChecker(result).visit(tree)
 
     return result
 
 
-def check_file(file_path: Path) -> SandboxResult:
+def check_file(file_path: Path, allowed_modules: set[str] | None = None) -> SandboxResult:
     """检查文件
 
     Args:
         file_path: Python 文件路径
+        allowed_modules: 额外允许的模块集合
 
     Returns:
         检查结果
@@ -282,14 +310,15 @@ def check_file(file_path: Path) -> SandboxResult:
         ))
         return result
 
-    return check_code(source)
+    return check_code(source, allowed_modules)
 
 
-def check_directory(dir_path: Path) -> SandboxResult:
+def check_directory(dir_path: Path, allowed_modules: set[str] | None = None) -> SandboxResult:
     """检查目录下所有 Python 文件
 
     Args:
         dir_path: 目录路径
+        allowed_modules: 额外允许的模块集合
 
     Returns:
         检查结果（汇总所有文件）
@@ -300,7 +329,7 @@ def check_directory(dir_path: Path) -> SandboxResult:
         if py_file.name.startswith("test_"):
             # 测试文件跳过检查
             continue
-        result = check_file(py_file)
+        result = check_file(py_file, allowed_modules)
         all_results.append(result)
 
     # 合并结果
@@ -338,7 +367,7 @@ class Sandbox:
         Returns:
             检查结果
         """
-        return check_code(source)
+        return check_code(source, self._allowed_modules)
 
     def check_file(self, file_path: Path) -> SandboxResult:
         """检查文件
@@ -349,7 +378,7 @@ class Sandbox:
         Returns:
             检查结果
         """
-        return check_file(file_path)
+        return check_file(file_path, self._allowed_modules)
 
     def check_directory(self, dir_path: Path) -> SandboxResult:
         """检查目录
@@ -360,7 +389,7 @@ class Sandbox:
         Returns:
             检查结果
         """
-        return check_directory(dir_path)
+        return check_directory(dir_path, self._allowed_modules)
 
     def load_module(self, name: str, path: Path) -> Any:
         """加载模块（受限制）

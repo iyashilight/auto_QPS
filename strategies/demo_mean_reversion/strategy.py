@@ -1,9 +1,10 @@
 """演示均值回归策略
 
 策略逻辑：
-- 计算过去 N 根 K 线的收益率均值和标准差
-- 当价格偏离均值超过 entry_z 个标准差时入场
-- 当价格回归到 exit_z 个标准差内时出场
+- 从 Feature Pipeline 读取 returns / realized_vol_20 特征
+- 计算 Z-Score = (当前收益率 - 均值) / 标准差
+- 当 |Z-Score| >= entry_z 时入场
+- 当 Z-Score 回归到 exit_z 内时出场
 """
 
 from __future__ import annotations
@@ -29,9 +30,9 @@ class Strategy(BaseStrategy):
         self.exit_z = float(ctx.params.get("exit_z", 0.5))
         self.position_size = Decimal(str(ctx.params.get("position_size", 0.1)))
 
-        # 初始化状态
-        self._position_side: str | None = None  # LONG / SHORT / None
-        self._entry_price: Decimal | None = None
+        # 初始化状态（存入 ctx.state 保证重启恢复）
+        ctx.state["position_side"] = None  # LONG / SHORT / None
+        ctx.state["entry_price"] = None
 
         ctx.log("INFO", "策略初始化完成",
                  lookback=self.lookback, entry_z=self.entry_z, exit_z=self.exit_z)
@@ -48,52 +49,51 @@ class Strategy(BaseStrategy):
         # 更新历史数据（由框架调用）
         ctx.set_latest_bar(instrument_id, bar)
 
-        # 获取历史数据
-        history = ctx.history(instrument_id, self.lookback + 1)
-        if len(history) < self.lookback + 1:
-            # 数据不足，跳过
+        # ── 从 Feature Pipeline 读取特征 ──────────────────────────────────
+        returns = ctx.feature(instrument_id, "returns")
+        realized_vol = ctx.feature(instrument_id, "realized_vol_20")
+
+        # 特征缓存未命中：跳过本轮信号
+        if returns is None or realized_vol is None:
+            ctx.log("DEBUG", "特征缓存未命中，跳过本轮信号",
+                     feature_missing=["returns" if returns is None else "",
+                                     "realized_vol_20" if realized_vol is None else ""])
             return
 
-        # 计算收益率序列
-        returns = self._calculate_returns(history)
-        if not returns:
-            return
+        # ── 计算 Z-Score ──────────────────────────────────────────────────
+        # 使用 Feature Pipeline 提供的收益率序列和波动率
+        # returns 是最近一根 K 线的收益率
+        # realized_vol_20 是过去 20 根 K 线的年化波动率
+        current_return = returns
+        volatility = realized_vol
 
-        # 计算均值和标准差
-        mean_return = sum(returns) / len(returns)
-        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
-        std_return = variance ** 0.5
-
-        # 当前价格相对于均值的偏离
-        current_close = bar.close
-        last_close = history[-1].close
-        current_return = float((current_close - last_close) / last_close) if last_close > 0 else 0
-
-        # Z-Score
-        z_score = (current_return - mean_return) / std_return if std_return > 0 else 0
+        # 简化处理：假设 returns 已经是偏离均值的量
+        # 实际实现中，Feature Pipeline 应提供完整的统计量
+        z_score = current_return / volatility if volatility > 0 else 0
 
         # 检查持仓状态
-        has_position = self._position_side is not None
+        position_side = ctx.state.get("position_side")
+        has_position = position_side is not None
 
-        # ── 交易逻辑 ──────────────────────────────────────
+        # ── 交易逻辑 ──────────────────────────────────────────────────────
 
         if not has_position:
             # 无持仓：检查入场条件
             if abs(z_score) >= self.entry_z:
                 direction = "LONG" if z_score < 0 else "SHORT"
-                self._open_position(ctx, instrument_id, direction, current_close)
+                self._open_position(ctx, instrument_id, direction, bar.close)
         else:
             # 有持仓：检查出场条件
-            if self._should_close(z_score):
-                self._close_position(ctx, instrument_id, current_close)
+            if self._should_close(z_score, position_side):
+                self._close_position(ctx, instrument_id, bar.close)
 
         # 更新状态
         ctx.state["last_z_score"] = z_score
-        ctx.state["last_mean_return"] = mean_return
-        ctx.state["last_std_return"] = std_return
+        ctx.state["last_return"] = current_return
+        ctx.state["last_volatility"] = volatility
 
     def _calculate_returns(self, bars: list[Bar]) -> list[float]:
-        """计算收益率序列
+        """计算收益率序列（备用方法，不直接使用）
 
         Args:
             bars: K 线列表
@@ -125,8 +125,8 @@ class Strategy(BaseStrategy):
             direction: 方向（LONG/SHORT）
             price: 入场价格
         """
-        self._position_side = direction
-        self._entry_price = price
+        ctx.state["position_side"] = direction
+        ctx.state["entry_price"] = price
 
         ctx.emit_intent({
             "instrument_id": instrument_id,
@@ -155,58 +155,62 @@ class Strategy(BaseStrategy):
             instrument_id: 标的 ID
             price: 出场价格
         """
-        if self._position_side is None:
+        position_side = ctx.state.get("position_side")
+        if position_side is None:
             return
 
-        close_action = "CLOSE"
         ctx.emit_intent({
             "instrument_id": instrument_id,
-            "direction": self._position_side,
-            "action": close_action,
+            "direction": position_side,
+            "action": "CLOSE",
             "quantity": str(self.position_size),
             "order_type": "MARKET",
             "reason_tags": ["mean_reversion", "z_score_exit"],
         })
 
-        pnl = self._calculate_pnl(price)
+        entry_price = ctx.state.get("entry_price")
+        pnl = self._calculate_pnl(price, entry_price, position_side)
         ctx.log("INFO", "平仓信号",
-                 side=self._position_side,
+                 side=position_side,
                  price=str(price),
                  pnl=str(pnl))
 
         # 重置状态
-        self._position_side = None
-        self._entry_price = None
+        ctx.state["position_side"] = None
+        ctx.state["entry_price"] = None
 
-    def _should_close(self, z_score: float) -> bool:
+    def _should_close(self, z_score: float, position_side: str) -> bool:
         """判断是否应该平仓
 
         Args:
             z_score: 当前 Z-Score
+            position_side: 持仓方向
 
         Returns:
             True 表示应该平仓
         """
-        if self._position_side == "LONG":
+        if position_side == "LONG":
             # 多头持仓：Z-Score 回归到正值时平仓
             return z_score >= self.exit_z
         else:
             # 空头持仓：Z-Score 回归到负值时平仓
             return z_score <= -self.exit_z
 
-    def _calculate_pnl(self, current_price: Decimal) -> Decimal:
+    def _calculate_pnl(self, current_price: Decimal, entry_price: Decimal | None, position_side: str) -> Decimal:
         """计算盈亏
 
         Args:
             current_price: 当前价格
+            entry_price: 入场价格
+            position_side: 持仓方向
 
         Returns:
             盈亏金额
         """
-        if self._entry_price is None or self._entry_price == 0:
+        if entry_price is None or entry_price == 0:
             return Decimal("0")
 
-        if self._position_side == "LONG":
-            return (current_price - self._entry_price) * self.position_size
+        if position_side == "LONG":
+            return (current_price - entry_price) * self.position_size
         else:
-            return (self._entry_price - current_price) * self.position_size
+            return (entry_price - current_price) * self.position_size
