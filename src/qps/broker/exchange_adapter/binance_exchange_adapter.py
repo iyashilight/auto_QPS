@@ -16,7 +16,7 @@ import hmac
 import logging
 import time
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from urllib.parse import urlencode
 
 import httpx
@@ -214,8 +214,9 @@ class BinanceExchangeAdapter:
         if testnet:
             base_url = "https://testnet.binance.vision"
             ws_base_url = "wss://testnet.binance.vision/ws"
-            futures_base_url = "https://testnet.binance.vision"
-            futures_ws_base_url = "wss://testnet.binance.vision/ws"
+            # 永续合约测试网使用不同的主机
+            futures_base_url = "https://testnet.binancefuture.com"
+            futures_ws_base_url = "wss://stream.binancefuture.com/ws"
 
         self._base_url = base_url.rstrip("/")
         self._ws_base_url = ws_base_url.rstrip("/")
@@ -323,10 +324,13 @@ class BinanceExchangeAdapter:
         self._ws = None
         self._ws_subscriptions.clear()
 
-        # 关闭 HTTP 客户端
+        # 关闭 HTTP 客户端（现货 + 永续）
         if self._client:
             await self._client.aclose()
             self._client = None
+        if self._futures_client:
+            await self._futures_client.aclose()
+            self._futures_client = None
 
         self._connected = False
         logger.info("Binance Exchange Adapter 已断开")
@@ -646,7 +650,8 @@ class BinanceExchangeAdapter:
                 ) from e
 
         # 返回原始 JSON（可能是 dict 或 list）
-        return response.json()
+        result = response.json()
+        return cast("dict[str, Any] | list[Any]", result)
 
     async def _ws_loop(self) -> None:
         """WebSocket 主循环：连接 → 订阅 → 接收 → 心跳 → 断线重连"""

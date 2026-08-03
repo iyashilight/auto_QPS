@@ -1013,8 +1013,13 @@ class QualityChecker:
             return result
 
         # 计算预期资金费率数量（8h 间隔）
+        # Binance 资金费率结算点为 00:00, 08:00, 16:00 UTC
+        # 需将 start 对齐到最近的结算点
         expected_interval = timedelta(hours=8)
-        current = start
+        # 对齐到最近的 Binance 结算点（00:00, 08:00, 16:00 UTC）
+        hours_offset = (start.hour % 8) * 3600 + start.minute * 60 + start.second
+        aligned_start = start + timedelta(seconds=(8 * 3600 - hours_offset) % (8 * 3600))
+        current = aligned_start
         while current < end:
             result["total_expected"] += 1
             current += expected_interval
@@ -1051,6 +1056,7 @@ class QualityChecker:
         instrument_id: str,
         start: datetime,
         end: datetime,
+        period: str = "5m",
     ) -> dict[str, Any]:
         """对持仓量数据执行质量检查
 
@@ -1058,6 +1064,7 @@ class QualityChecker:
             instrument_id: 内部标的 ID
             start: 检查开始时间
             end: 检查结束时间
+            period: OI 数据间隔（默认 5m）
 
         Returns:
             质量报告字典
@@ -1077,8 +1084,8 @@ class QualityChecker:
             result["missing_rate"] = 1.0
             return result
 
-        # 计算预期持仓量数量（5m 间隔）
-        expected_interval = timedelta(minutes=5)
+        # 计算预期持仓量数量（根据 period 参数）
+        expected_interval = _interval_to_timedelta(period)
         current = start
         while current < end:
             result["total_expected"] += 1

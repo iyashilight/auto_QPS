@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from qps.core.constants import DataQuality
-from qps.core.models.market import Bar, FundingRate
+from qps.core.models.market import Bar, FundingRate, OpenInterest
 from qps.data.pipeline.normalizer import (
     Normalizer,
     QualityChecker,
@@ -53,11 +53,26 @@ def _make_bar(
 def _make_funding_rate(
     funding_ts: datetime,
     rate: Decimal = Decimal("0.0001"),
+    data_version: str = "binance-test",
 ) -> FundingRate:
     return FundingRate(
         instrument_id="binance-btc-usdt-perp",
         funding_ts=funding_ts,
         rate=rate,
+        data_version=data_version,
+    )
+
+
+def _make_oi(
+    ts: datetime,
+    oi_value: Decimal = Decimal("1000000"),
+    data_version: str = "binance-test",
+) -> OpenInterest:
+    return OpenInterest(
+        instrument_id="binance-btc-usdt-perp",
+        ts=ts,
+        oi_value=oi_value,
+        data_version=data_version,
     )
 
 
@@ -315,3 +330,180 @@ class TestQualityChecker:
 
         assert report.total_bars == 2
         assert report.ok_bars == 2
+
+
+# ── FundingRate 规范化测试 ─────────────────────────────────
+
+
+class TestFundingRateNormalization:
+    def test_normalize_funding_rates_sorts_by_time(self, tmp_path: Path) -> None:
+        """资金费率按时间排序"""
+        normalizer = Normalizer(normalized_dir=tmp_path / "normalized")
+
+        rates = [
+            _make_funding_rate(datetime(2026, 1, 1, 8, 0, 0, tzinfo=UTC)),
+            _make_funding_rate(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)),
+        ]
+
+        result, _ = normalizer.normalize_funding_rates(rates, "binance-btc-usdt-perp")
+        assert result[0].funding_ts < result[1].funding_ts
+
+    def test_normalize_empty_funding_rates(self, tmp_path: Path) -> None:
+        """空数据返回空列表"""
+        normalizer = Normalizer(normalized_dir=tmp_path / "normalized")
+        result, report = normalizer.normalize_funding_rates([], "test")
+        assert result == []
+        assert report.total_bars == 0
+
+    def test_detect_abnormal_funding_rate(self, tmp_path: Path) -> None:
+        """异常费率标记为 SUSPECT（>1.0%）"""
+        normalizer = Normalizer(normalized_dir=tmp_path / "normalized")
+
+        rates = [
+            _make_funding_rate(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC), rate=Decimal("2.0")),
+        ]
+
+        result, report = normalizer.normalize_funding_rates(rates, "binance-btc-usdt-perp")
+        assert report.suspect_bars == 1
+
+    def test_write_normalized_funding_rates(self, tmp_path: Path) -> None:
+        """写入 Normalized 资金费率"""
+        normalizer = Normalizer(normalized_dir=tmp_path / "normalized")
+
+        rates = [
+            _make_funding_rate(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)),
+            _make_funding_rate(datetime(2026, 1, 1, 8, 0, 0, tzinfo=UTC)),
+        ]
+
+        result, _ = normalizer.normalize_funding_rates(rates, "binance-btc-usdt-perp")
+        path = normalizer.write_normalized_funding_rates(result, "binance-btc-usdt-perp")
+
+        assert path.exists()
+        assert path.name == "2026.parquet"
+
+
+# ── OpenInterest 规范化测试 ────────────────────────────────
+
+
+class TestOpenInterestNormalization:
+    def test_normalize_oi_sorts_by_time(self, tmp_path: Path) -> None:
+        """持仓量按时间排序"""
+        normalizer = Normalizer(normalized_dir=tmp_path / "normalized")
+
+        oi_list = [
+            _make_oi(datetime(2026, 1, 1, 0, 10, 0, tzinfo=UTC)),
+            _make_oi(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)),
+        ]
+
+        result, _ = normalizer.normalize_open_interest(oi_list, "binance-btc-usdt-perp")
+        assert result[0].ts < result[1].ts
+
+    def test_normalize_empty_oi(self, tmp_path: Path) -> None:
+        """空数据返回空列表"""
+        normalizer = Normalizer(normalized_dir=tmp_path / "normalized")
+        result, report = normalizer.normalize_open_interest([], "test")
+        assert result == []
+        assert report.total_bars == 0
+
+    def test_detect_negative_oi(self, tmp_path: Path) -> None:
+        """负 OI 值标记为 SUSPECT"""
+        normalizer = Normalizer(normalized_dir=tmp_path / "normalized")
+
+        oi_list = [
+            _make_oi(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC), oi_value=Decimal("-100")),
+        ]
+
+        result, report = normalizer.normalize_open_interest(oi_list, "binance-btc-usdt-perp")
+        assert report.suspect_bars == 1
+
+    def test_write_normalized_oi(self, tmp_path: Path) -> None:
+        """写入 Normalized 持仓量"""
+        normalizer = Normalizer(normalized_dir=tmp_path / "normalized")
+
+        oi_list = [
+            _make_oi(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)),
+            _make_oi(datetime(2026, 1, 1, 0, 5, 0, tzinfo=UTC)),
+        ]
+
+        result, _ = normalizer.normalize_open_interest(oi_list, "binance-btc-usdt-perp")
+        path = normalizer.write_normalized_open_interest(result, "binance-btc-usdt-perp")
+
+        assert path.exists()
+        assert path.name == "2026.parquet"
+
+
+# ── FundingRate/OI 质量检查测试 ────────────────────────────
+
+
+class TestFundingRateQualityCheck:
+    def test_check_nonexistent_funding(self, tmp_path: Path) -> None:
+        """不存在的数据返回缺失率 100%"""
+        checker = QualityChecker(normalized_dir=tmp_path / "normalized")
+        result = checker.check_funding_rates(
+            "binance-btc-usdt-perp",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        assert result["missing_rate"] == 1.0
+
+    def test_check_funding_with_aligned_start(self, tmp_path: Path) -> None:
+        """从 Binance 结算点（00:00 UTC）开始计算预期数量"""
+        normalized_dir = tmp_path / "normalized"
+        normalizer = Normalizer(normalized_dir=normalized_dir)
+
+        # 写入 3 条资金费率（00:00, 08:00, 16:00 UTC）
+        rates = [
+            _make_funding_rate(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)),
+            _make_funding_rate(datetime(2026, 1, 1, 8, 0, 0, tzinfo=UTC)),
+            _make_funding_rate(datetime(2026, 1, 1, 16, 0, 0, tzinfo=UTC)),
+        ]
+        result, _ = normalizer.normalize_funding_rates(rates, "binance-btc-usdt-perp")
+        normalizer.write_normalized_funding_rates(result, "binance-btc-usdt-perp")
+
+        checker = QualityChecker(normalized_dir=normalized_dir)
+        # start 对齐到 00:00 UTC（Binance 结算点）
+        result = checker.check_funding_rates(
+            "binance-btc-usdt-perp",
+            datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 1, 2, 0, 0, 0, tzinfo=UTC),
+        )
+        assert result["total_expected"] == 3  # 00:00, 08:00, 16:00
+        assert result["total_actual"] == 3
+        assert result["missing_rate"] == 0.0
+
+
+class TestOpenInterestQualityCheck:
+    def test_check_nonexistent_oi(self, tmp_path: Path) -> None:
+        """不存在的数据返回缺失率 100%"""
+        checker = QualityChecker(normalized_dir=tmp_path / "normalized")
+        result = checker.check_open_interest(
+            "binance-btc-usdt-perp",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        assert result["missing_rate"] == 1.0
+
+    def test_check_oi_with_period(self, tmp_path: Path) -> None:
+        """使用 period 参数计算预期数量"""
+        normalized_dir = tmp_path / "normalized"
+        normalizer = Normalizer(normalized_dir=normalized_dir)
+
+        # 写入 3 条 OI（每 5m）
+        oi_list = [
+            _make_oi(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)),
+            _make_oi(datetime(2026, 1, 1, 0, 5, 0, tzinfo=UTC)),
+            _make_oi(datetime(2026, 1, 1, 0, 10, 0, tzinfo=UTC)),
+        ]
+        result, _ = normalizer.normalize_open_interest(oi_list, "binance-btc-usdt-perp")
+        normalizer.write_normalized_open_interest(result, "binance-btc-usdt-perp")
+
+        checker = QualityChecker(normalized_dir=normalized_dir)
+        result = checker.check_open_interest(
+            "binance-btc-usdt-perp",
+            datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 1, 1, 0, 15, 0, tzinfo=UTC),
+            period="5m",
+        )
+        assert result["total_expected"] == 3  # 0:00, 0:05, 0:10
+        assert result["total_actual"] == 3
+        assert result["missing_rate"] == 0.0

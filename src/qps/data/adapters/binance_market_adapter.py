@@ -748,6 +748,10 @@ class BinanceMarketAdapter:
                 params={"symbol": exchange_symbol},
                 market=self._market_of(instrument_id),
             )
+            # M1.3: 确保 raw_data 是 dict（API 返回应该是 dict）
+            if not isinstance(raw_data, dict):
+                logger.warning("持仓量 API 返回非 dict: %s", type(raw_data))
+                return None
             # M1.3: exchange_ts 从 API 响应 time 字段取值（有则用，无则落 received 时间）
             exchange_ts = datetime.fromtimestamp(int(raw_data.get("time", 0)) / 1000, tz=UTC) if raw_data.get("time") else datetime.now(tz=UTC)
             return OpenInterest(
@@ -890,6 +894,10 @@ class BinanceMarketAdapter:
                 params={"symbol": exchange_symbol},
                 market=self._market_of(instrument_id),
             )
+            # M1.3: 确保 raw_data 是 dict（API 返回应该是 dict）
+            if not isinstance(raw_data, dict):
+                logger.warning("标记价格 API 返回非 dict: %s", type(raw_data))
+                return None
             # M1.3: exchange_ts 从 API 响应 time 字段取值（有则用，无则落 received 时间）
             exchange_ts = datetime.fromtimestamp(int(raw_data.get("time", 0)) / 1000, tz=UTC) if raw_data.get("time") else datetime.now(tz=UTC)
             return MarkPrice(

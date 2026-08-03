@@ -87,6 +87,7 @@ class FundingRate(BaseModel):
     predicted_rate: Decimal | None = Field(default=None, description="预测费率")
     settlement_ts: datetime | None = Field(default=None, description="结算时间")
     interval: str = Field(default="8h", description="费率间隔")
+    data_version: str = Field(default="unknown", description="数据批次版本")
 
     model_config = {"frozen": True}
 
@@ -103,6 +104,7 @@ class OpenInterest(BaseModel):
     oi_value: Decimal = Field(description="持仓量价值")
     oi_contracts: Decimal | None = Field(default=None, description="持仓量合约数")
     exchange_ts: datetime | None = Field(default=None, description="交易所时间")
+    data_version: str = Field(default="unknown", description="数据批次版本")
 
     model_config = {"frozen": True}
 

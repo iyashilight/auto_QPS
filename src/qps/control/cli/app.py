@@ -149,19 +149,39 @@ def data_collect(
                 typer.echo(f"💰 采集 {instrument} 资金费率...")
                 funding_rates = await market_adapter.fetch_funding_rates(instrument_id, start_dt, end_dt)
                 if funding_rates:
-                    raw_writer.write_funding_rates(symbol, funding_rates)
+                    raw_files_funding = raw_writer.write_funding_rates(symbol, funding_rates, mode=mode)
                     funding_count = len(funding_rates)
-                    typer.echo(f"   资金费率: {funding_count} 条")
+                    typer.echo(f"   资金费率 Raw: {len(raw_files_funding)} 个文件")
+
+                    # Normalized
+                    normalizer = Normalizer(normalized_dir=data_dir / "normalized")
+                    normalized_funding, _ = normalizer.normalize_funding_rates(funding_rates, instrument_id)
+                    norm_path_funding = normalizer.write_normalized_funding_rates(normalized_funding, instrument_id, mode=mode)
+                    typer.echo(f"   资金费率 Normalized: {norm_path_funding}")
 
             # 采集持仓量
             oi_count = 0
+            oi_actual_start: datetime | None = None
+            oi_actual_end: datetime | None = None
             if with_oi:
                 typer.echo(f"📈 采集 {instrument} 历史持仓量...")
                 oi_history = await market_adapter.fetch_historical_open_interest(instrument_id, start_dt, end_dt)
                 if oi_history:
-                    raw_writer.write_open_interest(symbol, oi_history)
+                    raw_files_oi = raw_writer.write_open_interest(symbol, oi_history, mode=mode)
                     oi_count = len(oi_history)
-                    typer.echo(f"   持仓量: {oi_count} 条")
+                    typer.echo(f"   持仓量 Raw: {len(raw_files_oi)} 个文件")
+
+                    # Normalized
+                    normalizer = Normalizer(normalized_dir=data_dir / "normalized")
+                    normalized_oi, _ = normalizer.normalize_open_interest(oi_history, instrument_id)
+                    norm_path_oi = normalizer.write_normalized_open_interest(normalized_oi, instrument_id, mode=mode)
+                    typer.echo(f"   持仓量 Normalized: {norm_path_oi}")
+
+                    # 记录实际覆盖范围
+                    if oi_history:
+                        sorted_oi = sorted(oi_history, key=lambda o: o.ts)
+                        oi_actual_start = sorted_oi[0].ts
+                        oi_actual_end = sorted_oi[-1].ts
 
             # 输出结果
             if json_output:
@@ -180,6 +200,12 @@ def data_collect(
                     "funding_rates_collected": funding_count,
                     "oi_collected": oi_count,
                 }
+                if with_funding and funding_count > 0:
+                    result["funding_normalized"] = str(norm_path_funding) if norm_path_funding else None
+                if with_oi and oi_count > 0:
+                    result["oi_normalized"] = str(norm_path_oi) if norm_path_oi else None
+                    result["oi_actual_start"] = oi_actual_start.isoformat() if oi_actual_start else None
+                    result["oi_actual_end"] = oi_actual_end.isoformat() if oi_actual_end else None
                 typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
             else:
                 typer.echo(f"✅ 采集完成: {len(bars)} 根 K 线")
@@ -191,9 +217,11 @@ def data_collect(
                 if report.suspect_bars > 0:
                     typer.echo(f"   可疑数据: {report.suspect_bars} 根")
                 if funding_count > 0:
-                    typer.echo(f"   资金费率: {funding_count} 条")
+                    typer.echo(f"   资金费率: {funding_count} 条 (Raw + Normalized)")
                 if oi_count > 0:
-                    typer.echo("   持仓量: 已采集")
+                    typer.echo(f"   持仓量: {oi_count} 条 (Raw + Normalized)")
+                    if oi_actual_start and oi_actual_end:
+                        typer.echo(f"   持仓量覆盖范围: {oi_actual_start.date()} ~ {oi_actual_end.date()}")
 
         except Exception as e:
             typer.echo(f"❌ 采集失败: {e}", err=True)
@@ -211,6 +239,9 @@ def data_verify(
     start: str | None = typer.Option(None, "--start", help="开始日期"),
     end: str | None = typer.Option(None, "--end", help="结束日期"),
     json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
+    with_funding: bool = typer.Option(False, "--with-funding", help="同时检查资金费率"),
+    with_oi: bool = typer.Option(False, "--with-oi", help="同时检查持仓量"),
+    oi_period: str = typer.Option("5m", "--oi-period", help="持仓量数据间隔（默认 5m）"),
 ) -> None:
     """数据质量检查"""
     from qps.data.pipeline.normalizer import QualityChecker
@@ -234,8 +265,23 @@ def data_verify(
     checker = QualityChecker(normalized_dir=data_dir / "normalized")
     report = checker.check_bars(instrument_id, interval, start_dt, end_dt)
 
+    # 可选：检查资金费率和持仓量
+    funding_report: dict[str, Any] | None = None
+    oi_report: dict[str, Any] | None = None
+
+    if with_funding:
+        funding_report = checker.check_funding_rates(instrument_id, start_dt, end_dt)
+
+    if with_oi:
+        oi_report = checker.check_open_interest(instrument_id, start_dt, end_dt, period=oi_period)
+
     if json_output:
-        typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        result = report.to_dict()
+        if funding_report:
+            result["funding"] = funding_report
+        if oi_report:
+            result["oi"] = oi_report
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         typer.echo(f"📊 数据质量报告: {instrument} ({interval})")
         typer.echo(f"   总 K 线数: {report.total_bars}")
@@ -245,6 +291,20 @@ def data_verify(
         typer.echo(f"   乱序: {report.out_of_order} 条")
         typer.echo(f"   价格跳变: {len(report.price_jumps)} 处")
         typer.echo(f"   整体质量: {report.overall_quality.value}")
+
+        if funding_report:
+            typer.echo("\n💰 资金费率质量:")
+            typer.echo(f"   预期数量: {funding_report['total_expected']}")
+            typer.echo(f"   实际数量: {funding_report['total_actual']}")
+            typer.echo(f"   缺失率: {funding_report['missing_rate']:.2%}")
+            typer.echo(f"   可疑记录: {funding_report['suspect_count']}")
+
+        if oi_report:
+            typer.echo("\n📈 持仓量质量:")
+            typer.echo(f"   预期数量: {oi_report['total_expected']}")
+            typer.echo(f"   实际数量: {oi_report['total_actual']}")
+            typer.echo(f"   缺失率: {oi_report['missing_rate']:.2%}")
+            typer.echo(f"   可疑记录: {oi_report['suspect_count']}")
 
 
 @data_app.command("compute")
