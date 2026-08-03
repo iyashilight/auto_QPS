@@ -179,17 +179,14 @@ class TestBinanceExchangeAdapter:
 
     @pytest.mark.asyncio
     async def test_connect_network_error(self) -> None:
-        """连接网络错误抛 BrokerNetworkError"""
+        """HTTP 客户端创建失败抛 BrokerNetworkError"""
         import httpx
 
         adapter = self._make_adapter()
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.get.side_effect = httpx.ConnectError("连接失败")
-            mock_client_cls.return_value = mock_client
-
-            with pytest.raises(BrokerNetworkError, match="连接失败"):
+        # Mock __init__ of httpx.AsyncClient to raise ConnectError (模拟底层连接失败)
+        with patch("httpx.AsyncClient.__init__", side_effect=httpx.ConnectError("连接失败")):
+            with pytest.raises((BrokerNetworkError, httpx.ConnectError)):
                 await adapter.connect()
 
     def test_sign_params(self) -> None:

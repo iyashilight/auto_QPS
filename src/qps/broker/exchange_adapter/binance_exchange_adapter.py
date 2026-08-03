@@ -291,8 +291,12 @@ class BinanceExchangeAdapter:
         )
 
         try:
-            # 校准服务器时间
-            await self._calibrate_server_time()
+            # 校准服务器时间（失败不阻塞连接）
+            try:
+                await self._calibrate_server_time()
+            except Exception as e:
+                logger.warning("服务器时间校准失败，将使用本地时间: %s", e)
+                self._server_time_offset = 0.0
             self._connected = True
             logger.info(
                 "Binance Exchange Adapter 已连接: spot=%s, futures=%s (testnet=%s)",
