@@ -176,10 +176,21 @@ class BinanceExchangeAdapter:
         "openInterest": "{symbol}@openInterest",
     }
 
+    # 单流模式事件类型映射（Binance 实际事件类型）
+    _WS_EVENT_TYPE_MAP: ClassVar[dict[str, str]] = {
+        "kline": "kline",
+        "markPrice": "markPriceUpdate",  # M1.3: Binance 实际事件类型是 markPriceUpdate
+        "forceOrder": "forceOrder",
+        "fundingRate": "fundingRate",
+        "openInterest": "openInterest",
+    }
+
     def __init__(
         self,
         base_url: str = "https://api.binance.com",
         ws_base_url: str = "wss://stream.binance.com:9443/ws",
+        futures_base_url: str = "https://fapi.binance.com",
+        futures_ws_base_url: str = "wss://fstream.binance.com/ws",
         testnet: bool = False,
         rate_limit_per_sec: float = 10.0,
         ws_rate_limit_per_sec: float = 5.0,
@@ -189,8 +200,10 @@ class BinanceExchangeAdapter:
         """初始化 Binance Exchange Adapter
 
         Args:
-            base_url: REST API 基础 URL
-            ws_base_url: WebSocket 基础 URL
+            base_url: 现货 REST API 基础 URL
+            ws_base_url: 现货 WebSocket 基础 URL
+            futures_base_url: 永续合约 REST API 基础 URL（默认 https://fapi.binance.com）
+            futures_ws_base_url: 永续合约 WebSocket 基础 URL（默认 wss://fstream.binance.com/ws）
             testnet: 是否使用测试网
             rate_limit_per_sec: REST 每秒请求数限制
             ws_rate_limit_per_sec: WebSocket 每秒请求数限制
@@ -201,9 +214,13 @@ class BinanceExchangeAdapter:
         if testnet:
             base_url = "https://testnet.binance.vision"
             ws_base_url = "wss://testnet.binance.vision/ws"
+            futures_base_url = "https://testnet.binance.vision"
+            futures_ws_base_url = "wss://testnet.binance.vision/ws"
 
         self._base_url = base_url.rstrip("/")
         self._ws_base_url = ws_base_url.rstrip("/")
+        self._futures_base_url = futures_base_url.rstrip("/")
+        self._futures_ws_base_url = futures_ws_base_url.rstrip("/")
         self._testnet = testnet
         self._request_timeout = request_timeout
         self._retry_policy = retry_policy or RetryPolicy()
@@ -222,16 +239,19 @@ class BinanceExchangeAdapter:
         self._last_heartbeat: datetime | None = None
         self._server_time_offset: float = 0.0  # 本地 - 服务器 偏移（秒）
 
-        # HTTP 客户端
+        # HTTP 客户端（现货 + 永续两套）
         self._client: httpx.AsyncClient | None = None
+        self._futures_client: httpx.AsyncClient | None = None
 
         # WebSocket 相关
         self._ws: Any = None  # websockets.WebSocketClientProtocol
         self._ws_task: asyncio.Task[None] | None = None
-        self._ws_subscriptions: dict[str, dict[str, Any]] = {}  # sub_id -> {channel, payload, callback}
+        self._ws_subscriptions: dict[str, dict[str, Any]] = {}  # sub_id -> {channel, payload, callback, market}
         self._ws_sub_counter: int = 0
         self._ws_reconnect_delay: float = 1.0
         self._ws_max_reconnect_delay: float = 60.0
+        # 当前活跃的 WS 市场（用于重连时选择正确的主机）
+        self._active_ws_market: str = "spot"
 
     # ── ExchangeAdapterPort 接口实现 ────────────────────────
 
@@ -253,7 +273,7 @@ class BinanceExchangeAdapter:
             self._api_key = credentials.get("api_key")
             self._api_secret = credentials.get("api_secret")
 
-        # 创建 HTTP 客户端
+        # 创建 HTTP 客户端（现货 + 永续两套）
         headers: dict[str, str] = {}
         if self._api_key:
             headers["X-MBX-APIKEY"] = self._api_key
@@ -263,14 +283,20 @@ class BinanceExchangeAdapter:
             timeout=httpx.Timeout(self._request_timeout),
             headers=headers,
         )
+        self._futures_client = httpx.AsyncClient(
+            base_url=self._futures_base_url,
+            timeout=httpx.Timeout(self._request_timeout),
+            headers=headers,
+        )
 
         try:
             # 校准服务器时间
             await self._calibrate_server_time()
             self._connected = True
             logger.info(
-                "Binance Exchange Adapter 已连接: %s (testnet=%s)",
+                "Binance Exchange Adapter 已连接: spot=%s, futures=%s (testnet=%s)",
                 self._base_url,
+                self._futures_base_url,
                 self._testnet,
             )
         except httpx.TimeoutException as e:
@@ -311,17 +337,19 @@ class BinanceExchangeAdapter:
         path: str,
         params: dict[str, Any] | None = None,
         signed: bool = False,
-    ) -> dict[str, Any]:
+        market: str = "spot",
+    ) -> dict[str, Any] | list[Any]:
         """发送 REST 请求
 
         Args:
             method: HTTP 方法（GET/POST/PUT/DELETE）
-            path: API 路径（如 /api/v3/klines）
+            path: API 路径（如 /api/v3/klines 或 /fapi/v1/klines）
             params: 请求参数
             signed: 是否需要签名
+            market: 市场维度 - 'spot'（现货，默认）或 'futures'（永续）
 
         Returns:
-            交易所原始响应（dict）
+            交易所原始响应（dict 或 list）
 
         Raises:
             BrokerNetworkError: 网络错误/超时
@@ -333,6 +361,14 @@ class BinanceExchangeAdapter:
             raise BrokerNetworkError(detail="未连接，请先调用 connect()")
 
         params = dict(params) if params else {}
+
+        # 根据 path 前缀或显式 market 参数选择主机
+        effective_market = market
+        if path.startswith("/fapi/") or path.startswith("/futures/"):
+            effective_market = "futures"
+
+        # 选择客户端
+        client = self._futures_client if effective_market == "futures" else self._client
 
         # 签名
         if signed:
@@ -347,7 +383,7 @@ class BinanceExchangeAdapter:
         last_error: Exception | None = None
         for attempt in range(self._retry_policy.max_retries + 1):
             try:
-                response = await self._send_request(method, path, params)
+                response = await self._send_request(method, path, params, client)
                 return response
             except BrokerRateLimitError as e:
                 # 限频：等待 retry-after 后重试
@@ -379,6 +415,7 @@ class BinanceExchangeAdapter:
         channel: str,
         payload: dict[str, Any],
         callback: Callable[[dict[str, Any]], None],
+        market: str = "spot",
     ) -> str:
         """订阅 WebSocket 频道
 
@@ -386,6 +423,7 @@ class BinanceExchangeAdapter:
             channel: 频道名（如 kline/markPrice/fundingRate）
             payload: 订阅参数（如 {"symbol": "btcusdt", "interval": "5m"}）
             callback: 消息回调
+            market: 市场维度 - 'spot'（现货，默认）或 'futures'（永续）
 
         Returns:
             订阅 ID
@@ -397,14 +435,16 @@ class BinanceExchangeAdapter:
             "channel": channel,
             "payload": payload,
             "callback": callback,
+            "market": market,
         }
 
         # 如果 WebSocket 已连接，立即发送订阅
         if self._ws is not None:
-            await self._ws_send_subscribe(channel, payload)
+            await self._ws_send_subscribe(channel, payload, market)
 
         # 如果 WebSocket 未连接，启动连接
         if self._ws is None and self._ws_task is None:
+            self._active_ws_market = market
             self._ws_task = asyncio.create_task(self._ws_loop())
 
         return sub_id
@@ -532,16 +572,18 @@ class BinanceExchangeAdapter:
         method: str,
         path: str,
         params: dict[str, Any],
-    ) -> dict[str, Any]:
+        client: httpx.AsyncClient | None = None,
+    ) -> dict[str, Any] | list[Any]:
         """发送单次 HTTP 请求并处理响应
 
         Args:
             method: HTTP 方法
             path: API 路径
             params: 请求参数
+            client: HTTP 客户端（可选，默认使用现货客户端）
 
         Returns:
-            响应 JSON
+            响应 JSON（dict 或 list）
 
         Raises:
             BrokerNetworkError: 网络错误
@@ -549,17 +591,19 @@ class BinanceExchangeAdapter:
             BrokerBusinessError: 业务错误
             BrokerAuthError: 认证错误
         """
-        assert self._client is not None
+        if client is None:
+            client = self._client
+        assert client is not None
 
         try:
             if method.upper() == "GET":
-                response = await self._client.get(path, params=params)
+                response = await client.get(path, params=params)
             elif method.upper() == "POST":
-                response = await self._client.post(path, params=params)
+                response = await client.post(path, params=params)
             elif method.upper() == "PUT":
-                response = await self._client.put(path, params=params)
+                response = await client.put(path, params=params)
             elif method.upper() == "DELETE":
-                response = await self._client.delete(path, params=params)
+                response = await client.delete(path, params=params)
             else:
                 raise BrokerBusinessError(detail=f"不支持的 HTTP 方法: {method}")
         except httpx.TimeoutException as e:
@@ -601,8 +645,8 @@ class BinanceExchangeAdapter:
                     detail=f"Binance HTTP 错误: status={response.status_code}, body={response.text[:200]}"
                 ) from e
 
-        result: dict[str, Any] = response.json()
-        return result
+        # 返回原始 JSON（可能是 dict 或 list）
+        return response.json()
 
     async def _ws_loop(self) -> None:
         """WebSocket 主循环：连接 → 订阅 → 接收 → 心跳 → 断线重连"""
@@ -610,11 +654,13 @@ class BinanceExchangeAdapter:
 
         while True:
             try:
-                async with websockets.connect(self._ws_base_url) as ws:
+                # 根据活跃市场选择 WS 主机
+                ws_url = self._futures_ws_base_url if self._active_ws_market == "futures" else self._ws_base_url
+                async with websockets.connect(ws_url) as ws:
                     self._ws = ws
                     self._reconnect_count += 1 if self._ws_subscriptions else 0
                     self._ws_reconnect_delay = 1.0  # 重置重连延迟
-                    logger.info("WebSocket 已连接: %s", self._ws_base_url)
+                    logger.info("WebSocket 已连接: %s (market=%s)", ws_url, self._active_ws_market)
 
                     # 重新订阅所有频道
                     await self._ws_resubscribe_all()
@@ -652,6 +698,7 @@ class BinanceExchangeAdapter:
                 await self._ws_send_subscribe(
                     sub_info["channel"],
                     sub_info["payload"],
+                    sub_info.get("market", "spot"),
                 )
             except Exception:
                 logger.exception("重新订阅失败: sub_id=%s", sub_id)
@@ -660,8 +707,15 @@ class BinanceExchangeAdapter:
         self,
         channel: str,
         payload: dict[str, Any],
+        market: str = "spot",
     ) -> None:
-        """发送 WebSocket 订阅请求"""
+        """发送 WebSocket 订阅请求
+
+        Args:
+            channel: 频道名
+            payload: 订阅参数
+            market: 市场维度 - 'spot' 或 'futures'
+        """
         if self._ws is None:
             return
 
@@ -730,14 +784,9 @@ class BinanceExchangeAdapter:
             elif not stream_name:
                 # 单流模式：按事件类型匹配
                 event_type = event_data.get("e", "")
-                channel_event_map = {
-                    "kline": "kline",
-                    "markPrice": "markPrice",
-                    "forceOrder": "forceOrder",
-                    "fundingRate": "fundingRate",
-                    "openInterest": "openInterest",
-                }
-                if channel_event_map.get(event_type) == channel:
+                # M1.3: 使用正确的事件类型映射
+                mapped_event_type = self._WS_EVENT_TYPE_MAP.get(channel, channel)
+                if event_type == mapped_event_type:
                     try:
                         callback(event_data)
                     except Exception:

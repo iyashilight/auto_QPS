@@ -177,8 +177,19 @@ class RawWriter:
         symbol: str,
         rates: list[FundingRate],
         batch_id: str | None = None,
+        mode: str = "merge",
     ) -> list[Path]:
-        """写入资金费率到 Raw 层"""
+        """写入资金费率到 Raw 层
+
+        Args:
+            symbol: 交易所符号（如 btcusdt-perp）
+            rates: FundingRate 列表
+            batch_id: 批次 ID
+            mode: 写入模式 - 'merge'（合并去重，默认）、'overwrite'（覆盖）、'skip'（跳过已有）
+
+        Returns:
+            写入的文件路径列表
+        """
         if not rates:
             return []
 
@@ -197,8 +208,33 @@ class RawWriter:
             partition_dir.mkdir(parents=True, exist_ok=True)
 
             existing_file = partition_dir / "part-000.parquet"
+
             if existing_file.exists():
-                continue
+                if mode == "skip":
+                    logger.debug("Raw funding 分区已存在，跳过: %s", existing_file)
+                    continue
+                elif mode == "merge":
+                    # 合并模式：读取已有数据，合并后按 funding_ts 去重
+                    existing_df = pl.read_parquet(existing_file)
+                    new_rows = [
+                        {
+                            "instrument_id": r.instrument_id,
+                            "funding_ts": r.funding_ts.isoformat(),
+                            "rate": str(r.rate),
+                            "predicted_rate": str(r.predicted_rate) if r.predicted_rate else None,
+                            "interval": r.interval,
+                            "data_version": data_version,
+                        }
+                        for r in day_rates
+                    ]
+                    new_df = pl.DataFrame(new_rows)
+                    merged = pl.concat([existing_df, new_df])
+                    merged = merged.sort("funding_ts").unique(subset=["funding_ts"], keep="last")
+                    merged.write_parquet(existing_file)
+                    written_files.append(existing_file)
+                    logger.debug("合并 Raw 资金费率: %s (%d rates)", existing_file, len(merged))
+                    continue
+                # overwrite 模式继续执行
 
             rows = [
                 {
@@ -214,6 +250,7 @@ class RawWriter:
             df = pl.DataFrame(rows)
             df.write_parquet(existing_file)
             written_files.append(existing_file)
+            logger.debug("写入 Raw 资金费率: %s (%d rates)", existing_file, len(day_rates))
 
         return written_files
 
@@ -222,6 +259,7 @@ class RawWriter:
         symbol: str,
         oi_list: list[OpenInterest],
         batch_id: str | None = None,
+        mode: str = "merge",
     ) -> list[Path]:
         """写入持仓量到 Raw 层
 
@@ -229,6 +267,7 @@ class RawWriter:
             symbol: 交易所符号（如 btcusdt）
             oi_list: OpenInterest 列表
             batch_id: 批次 ID
+            mode: 写入模式 - 'merge'（合并去重，默认）、'overwrite'（覆盖）、'skip'（跳过已有）
 
         Returns:
             写入的文件路径列表
@@ -251,8 +290,33 @@ class RawWriter:
             partition_dir.mkdir(parents=True, exist_ok=True)
 
             existing_file = partition_dir / "part-000.parquet"
+
             if existing_file.exists():
-                continue
+                if mode == "skip":
+                    logger.debug("Raw OI 分区已存在，跳过: %s", existing_file)
+                    continue
+                elif mode == "merge":
+                    # 合并模式：读取已有数据，合并后按 ts 去重
+                    existing_df = pl.read_parquet(existing_file)
+                    new_rows = [
+                        {
+                            "instrument_id": o.instrument_id,
+                            "ts": o.ts.isoformat(),
+                            "oi_value": str(o.oi_value),
+                            "oi_contracts": str(o.oi_contracts) if o.oi_contracts else None,
+                            "exchange_ts": o.exchange_ts.isoformat() if o.exchange_ts else None,
+                            "data_version": data_version,
+                        }
+                        for o in day_oi
+                    ]
+                    new_df = pl.DataFrame(new_rows)
+                    merged = pl.concat([existing_df, new_df])
+                    merged = merged.sort("ts").unique(subset=["ts"], keep="last")
+                    merged.write_parquet(existing_file)
+                    written_files.append(existing_file)
+                    logger.debug("合并 Raw OI: %s (%d records)", existing_file, len(merged))
+                    continue
+                # overwrite 模式继续执行
 
             rows = [
                 {
@@ -268,6 +332,7 @@ class RawWriter:
             df = pl.DataFrame(rows)
             df.write_parquet(existing_file)
             written_files.append(existing_file)
+            logger.debug("写入 Raw OI: %s (%d records)", existing_file, len(day_oi))
 
         return written_files
 
@@ -551,6 +616,280 @@ class Normalizer:
 
         return gaps
 
+    def normalize_funding_rates(
+        self,
+        rates: list[FundingRate],
+        instrument_id: str,
+    ) -> tuple[list[FundingRate], QualityReport]:
+        """规范化资金费率数据
+
+        Args:
+            rates: 原始资金费率列表
+            instrument_id: 统一标的 ID
+
+        Returns:
+            (规范化后的 FundingRate 列表, 质量报告)
+        """
+        report = QualityReport(
+            instrument_id=instrument_id,
+            interval="8h",
+            data_version=rates[0].data_version if rates else "unknown",
+        )
+        report.total_bars = len(rates)
+
+        if not rates:
+            return [], report
+
+        # 按时间排序
+        sorted_rates = sorted(rates, key=lambda r: r.funding_ts)
+
+        # 异常清洗与质量标记
+        normalized: list[FundingRate] = []
+
+        for rate in sorted_rates:
+            reasons: list[str] = []
+
+            # 费率合理性检查
+            if abs(rate.rate) > Decimal("1.0"):
+                reasons.append(f"费率异常: {rate.rate}")
+
+            # 标记质量
+            if reasons:
+                report.suspect_bars += 1
+                logger.debug(
+                    "SUSPECT 资金费率: %s %s, 原因: %s",
+                    rate.instrument_id,
+                    rate.funding_ts.isoformat(),
+                    ", ".join(reasons),
+                )
+            else:
+                report.ok_bars += 1
+
+            # 重建 FundingRate（统一 instrument_id）
+            normalized_rate = FundingRate(
+                instrument_id=instrument_id,
+                funding_ts=rate.funding_ts,
+                rate=rate.rate,
+                predicted_rate=rate.predicted_rate,
+                interval=rate.interval,
+            )
+            normalized.append(normalized_rate)
+
+        return normalized, report
+
+    def write_normalized_funding_rates(
+        self,
+        rates: list[FundingRate],
+        instrument_id: str,
+        mode: str = "merge",
+    ) -> Path:
+        """写入 Normalized 资金费率数据
+
+        按年分片：data/normalized/funding/<instrument>/<YYYY>.parquet
+
+        Args:
+            rates: 规范化后的资金费率列表
+            instrument_id: 内部标的 ID
+            mode: 写入模式 - 'merge'（合并去重，默认）、'overwrite'（覆盖）、'skip'（跳过已有）
+
+        Returns:
+            写入的文件路径
+        """
+        if not rates:
+            raise DataError(detail="无数据可写入")
+
+        symbol_dir = instrument_id.split("-", 1)[-1] if "-" in instrument_id else instrument_id
+
+        last_path: Path | None = None
+
+        # 按年分组处理
+        by_year: dict[int, list[FundingRate]] = {}
+        for rate in rates:
+            year = rate.funding_ts.year
+            by_year.setdefault(year, []).append(rate)
+
+        for year, year_rates in sorted(by_year.items()):
+            out_dir = self._normalized_dir / "funding" / symbol_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            out_path = out_dir / f"{year}.parquet"
+
+            if out_path.exists() and mode == "merge":
+                # 合并模式：读取已有数据，合并后去重
+                existing_df = pl.read_parquet(out_path)
+                new_rows = [
+                    {
+                        "instrument_id": r.instrument_id,
+                        "funding_ts": r.funding_ts.isoformat(),
+                        "rate": str(r.rate),
+                        "predicted_rate": str(r.predicted_rate) if r.predicted_rate else None,
+                        "interval": r.interval,
+                    }
+                    for r in year_rates
+                ]
+                new_df = pl.DataFrame(new_rows)
+                merged = pl.concat([existing_df, new_df])
+                merged = merged.sort("funding_ts").unique(subset=["funding_ts"], keep="last")
+                merged.write_parquet(out_path)
+                last_path = out_path
+                logger.debug("合并 Normalized 资金费率: %s (%d rates)", out_path, len(merged))
+            else:
+                rows = [
+                    {
+                        "instrument_id": r.instrument_id,
+                        "funding_ts": r.funding_ts.isoformat(),
+                        "rate": str(r.rate),
+                        "predicted_rate": str(r.predicted_rate) if r.predicted_rate else None,
+                        "interval": r.interval,
+                    }
+                    for r in year_rates
+                ]
+                df = pl.DataFrame(rows)
+                df.write_parquet(out_path)
+                last_path = out_path
+                logger.debug("写入 Normalized 资金费率: %s (%d rates)", out_path, len(year_rates))
+
+        if last_path is None:
+            raise DataError(detail="无数据可写入")
+        return last_path
+
+    def normalize_open_interest(
+        self,
+        oi_list: list[OpenInterest],
+        instrument_id: str,
+    ) -> tuple[list[OpenInterest], QualityReport]:
+        """规范化持仓量数据
+
+        Args:
+            oi_list: 原始持仓量列表
+            instrument_id: 统一标的 ID
+
+        Returns:
+            (规范化后的 OpenInterest 列表, 质量报告)
+        """
+        report = QualityReport(
+            instrument_id=instrument_id,
+            interval="5m",
+            data_version=oi_list[0].data_version if oi_list else "unknown",
+        )
+        report.total_bars = len(oi_list)
+
+        if not oi_list:
+            return [], report
+
+        # 按时间排序
+        sorted_oi = sorted(oi_list, key=lambda o: o.ts)
+
+        # 异常清洗与质量标记
+        normalized: list[OpenInterest] = []
+
+        for oi in sorted_oi:
+            reasons: list[str] = []
+
+            # OI 值合理性检查
+            if oi.oi_value <= 0:
+                reasons.append("OI 值为负或零")
+
+            # 标记质量
+            if reasons:
+                report.suspect_bars += 1
+                logger.debug(
+                    "SUSPECT 持仓量: %s %s, 原因: %s",
+                    oi.instrument_id,
+                    oi.ts.isoformat(),
+                    ", ".join(reasons),
+                )
+            else:
+                report.ok_bars += 1
+
+            # 重建 OpenInterest（统一 instrument_id）
+            normalized_oi = OpenInterest(
+                instrument_id=instrument_id,
+                ts=oi.ts,
+                oi_value=oi.oi_value,
+                oi_contracts=oi.oi_contracts,
+                exchange_ts=oi.exchange_ts,
+            )
+            normalized.append(normalized_oi)
+
+        return normalized, report
+
+    def write_normalized_open_interest(
+        self,
+        oi_list: list[OpenInterest],
+        instrument_id: str,
+        mode: str = "merge",
+    ) -> Path:
+        """写入 Normalized 持仓量数据
+
+        按年分片：data/normalized/open_interest/<instrument>/<YYYY>.parquet
+
+        Args:
+            oi_list: 规范化后的持仓量列表
+            instrument_id: 内部标的 ID
+            mode: 写入模式 - 'merge'（合并去重，默认）、'overwrite'（覆盖）、'skip'（跳过已有）
+
+        Returns:
+            写入的文件路径
+        """
+        if not oi_list:
+            raise DataError(detail="无数据可写入")
+
+        symbol_dir = instrument_id.split("-", 1)[-1] if "-" in instrument_id else instrument_id
+
+        last_path: Path | None = None
+
+        # 按年分组处理
+        by_year: dict[int, list[OpenInterest]] = {}
+        for oi in oi_list:
+            year = oi.ts.year
+            by_year.setdefault(year, []).append(oi)
+
+        for year, year_oi in sorted(by_year.items()):
+            out_dir = self._normalized_dir / "open_interest" / symbol_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            out_path = out_dir / f"{year}.parquet"
+
+            if out_path.exists() and mode == "merge":
+                # 合并模式：读取已有数据，合并后去重
+                existing_df = pl.read_parquet(out_path)
+                new_rows = [
+                    {
+                        "instrument_id": o.instrument_id,
+                        "ts": o.ts.isoformat(),
+                        "oi_value": str(o.oi_value),
+                        "oi_contracts": str(o.oi_contracts) if o.oi_contracts else None,
+                        "exchange_ts": o.exchange_ts.isoformat() if o.exchange_ts else None,
+                    }
+                    for o in year_oi
+                ]
+                new_df = pl.DataFrame(new_rows)
+                merged = pl.concat([existing_df, new_df])
+                merged = merged.sort("ts").unique(subset=["ts"], keep="last")
+                merged.write_parquet(out_path)
+                last_path = out_path
+                logger.debug("合并 Normalized OI: %s (%d records)", out_path, len(merged))
+            else:
+                rows = [
+                    {
+                        "instrument_id": o.instrument_id,
+                        "ts": o.ts.isoformat(),
+                        "oi_value": str(o.oi_value),
+                        "oi_contracts": str(o.oi_contracts) if o.oi_contracts else None,
+                        "exchange_ts": o.exchange_ts.isoformat() if o.exchange_ts else None,
+                    }
+                    for o in year_oi
+                ]
+                df = pl.DataFrame(rows)
+                df.write_parquet(out_path)
+                last_path = out_path
+                logger.debug("写入 Normalized OI: %s (%d records)", out_path, len(year_oi))
+
+        if last_path is None:
+            raise DataError(detail="无数据可写入")
+        return last_path
+
 
 # ── 数据质量检查 ──────────────────────────────────────────
 
@@ -641,6 +980,136 @@ class QualityChecker:
                 report.out_of_order += 1
 
         return report
+
+    def check_funding_rates(
+        self,
+        instrument_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> dict[str, Any]:
+        """对资金费率数据执行质量检查
+
+        Args:
+            instrument_id: 内部标的 ID
+            start: 检查开始时间
+            end: 检查结束时间
+
+        Returns:
+            质量报告字典
+        """
+        symbol_dir = instrument_id.split("-", 1)[-1] if "-" in instrument_id else instrument_id
+        data_dir = self._normalized_dir / "funding" / symbol_dir
+
+        result: dict[str, Any] = {
+            "instrument_id": instrument_id,
+            "total_expected": 0,
+            "total_actual": 0,
+            "missing_rate": 0.0,
+            "suspect_count": 0,
+        }
+
+        if not data_dir.exists():
+            result["missing_rate"] = 1.0
+            return result
+
+        # 计算预期资金费率数量（8h 间隔）
+        expected_interval = timedelta(hours=8)
+        current = start
+        while current < end:
+            result["total_expected"] += 1
+            current += expected_interval
+
+        # 读取实际数据
+        all_rates: list[FundingRate] = []
+        for year in range(start.year, end.year + 1):
+            parquet_path = data_dir / f"{year}.parquet"
+            if parquet_path.exists():
+                try:
+                    df = pl.read_parquet(parquet_path)
+                    for row in df.iter_rows(named=True):
+                        funding_ts = datetime.fromisoformat(row["funding_ts"])
+                        if start <= funding_ts < end:
+                            all_rates.append(FundingRate(
+                                instrument_id=row["instrument_id"],
+                                funding_ts=funding_ts,
+                                rate=Decimal(row["rate"]),
+                                predicted_rate=Decimal(row["predicted_rate"]) if row.get("predicted_rate") else None,
+                                interval=row.get("interval", "8h"),
+                            ))
+                except Exception:
+                    logger.exception("读取 Normalized 资金费率失败: %s", parquet_path)
+                    continue
+
+        result["total_actual"] = len(all_rates)
+        result["missing_rate"] = 1.0 - (len(all_rates) / result["total_expected"]) if result["total_expected"] > 0 else 1.0
+        result["suspect_count"] = sum(1 for r in all_rates if abs(r.rate) > Decimal("1.0"))
+
+        return result
+
+    def check_open_interest(
+        self,
+        instrument_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> dict[str, Any]:
+        """对持仓量数据执行质量检查
+
+        Args:
+            instrument_id: 内部标的 ID
+            start: 检查开始时间
+            end: 检查结束时间
+
+        Returns:
+            质量报告字典
+        """
+        symbol_dir = instrument_id.split("-", 1)[-1] if "-" in instrument_id else instrument_id
+        data_dir = self._normalized_dir / "open_interest" / symbol_dir
+
+        result: dict[str, Any] = {
+            "instrument_id": instrument_id,
+            "total_expected": 0,
+            "total_actual": 0,
+            "missing_rate": 0.0,
+            "suspect_count": 0,
+        }
+
+        if not data_dir.exists():
+            result["missing_rate"] = 1.0
+            return result
+
+        # 计算预期持仓量数量（5m 间隔）
+        expected_interval = timedelta(minutes=5)
+        current = start
+        while current < end:
+            result["total_expected"] += 1
+            current += expected_interval
+
+        # 读取实际数据
+        all_oi: list[OpenInterest] = []
+        for year in range(start.year, end.year + 1):
+            parquet_path = data_dir / f"{year}.parquet"
+            if parquet_path.exists():
+                try:
+                    df = pl.read_parquet(parquet_path)
+                    for row in df.iter_rows(named=True):
+                        ts = datetime.fromisoformat(row["ts"])
+                        if start <= ts < end:
+                            all_oi.append(OpenInterest(
+                                instrument_id=row["instrument_id"],
+                                ts=ts,
+                                oi_value=Decimal(row["oi_value"]),
+                                oi_contracts=Decimal(row["oi_contracts"]) if row.get("oi_contracts") else None,
+                                exchange_ts=datetime.fromisoformat(row["exchange_ts"]) if row.get("exchange_ts") else None,
+                            ))
+                except Exception:
+                    logger.exception("读取 Normalized 持仓量失败: %s", parquet_path)
+                    continue
+
+        result["total_actual"] = len(all_oi)
+        result["missing_rate"] = 1.0 - (len(all_oi) / result["total_expected"]) if result["total_expected"] > 0 else 1.0
+        result["suspect_count"] = sum(1 for o in all_oi if o.oi_value <= 0)
+
+        return result
 
 
 # ── 工具函数 ──────────────────────────────────────────────

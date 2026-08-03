@@ -27,14 +27,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ── 符号映射 ──────────────────────────────────────────────
+# 符号映射
 
 # 内部符号 → Binance 交易所符号
 _SYMBOL_MAP: dict[str, str] = {
     "BTC-USDT-PERP": "BTCUSDT",
     "ETH-USDT-PERP": "ETHUSDT",
+    "SOL-USDT-PERP": "SOLUSDT",
     "BTC-USDT": "BTCUSDT",
     "ETH-USDT": "ETHUSDT",
+    "SOL-USDT": "SOLUSDT",
 }
 
 # Binance 交易所符号 → 内部符号
@@ -271,6 +273,19 @@ class BinanceMarketAdapter:
         self._connected = False
         logger.info("Binance Market Adapter 已断开")
 
+    def _market_of(self, instrument_id: str) -> str:
+        """判断标的属于哪个市场
+
+        Args:
+            instrument_id: 内部标的 ID
+
+        Returns:
+            'futures' 或 'spot'
+        """
+        if "-PERP" in instrument_id.upper():
+            return "futures"
+        return "spot"
+
     async def subscribe_bars(
         self,
         instrument_id: str,
@@ -295,6 +310,7 @@ class BinanceMarketAdapter:
 
         exchange_symbol = _to_exchange_symbol(instrument_id)
         binance_interval = _INTERVAL_MAP[interval]
+        market = self._market_of(instrument_id)
 
         self._sub_counter += 1
         sub_id = f"market_sub_{self._sub_counter}"
@@ -317,6 +333,7 @@ class BinanceMarketAdapter:
             "kline",
             {"symbol": exchange_symbol, "interval": binance_interval},
             on_kline,
+            market=market,
         )
 
         self._subscriptions[sub_id] = {
@@ -324,6 +341,7 @@ class BinanceMarketAdapter:
             "instrument_id": instrument_id,
             "interval": interval,
             "ws_sub_id": ws_sub_id,
+            "market": market,
             "callback": callback,
         }
 
@@ -347,6 +365,7 @@ class BinanceMarketAdapter:
             raise BrokerNetworkError(detail="Market Adapter 未连接")
 
         exchange_symbol = _to_exchange_symbol(instrument_id)
+        market = self._market_of(instrument_id)
 
         self._sub_counter += 1
         sub_id = f"market_sub_{self._sub_counter}"
@@ -363,12 +382,14 @@ class BinanceMarketAdapter:
             "fundingRate",
             {"symbol": exchange_symbol},
             on_funding,
+            market=market,
         )
 
         self._subscriptions[sub_id] = {
             "type": "funding",
             "instrument_id": instrument_id,
             "ws_sub_id": ws_sub_id,
+            "market": market,
             "callback": callback,
         }
 
@@ -418,12 +439,10 @@ class BinanceMarketAdapter:
 
         exchange_symbol = _to_exchange_symbol(instrument_id)
         binance_interval = _INTERVAL_MAP[interval]
+        market = self._market_of(instrument_id)
 
-        # 根据 instrument_id 类型选择 API 端点
-        # PERP → /fapi/v1/klines (永续合约)
-        # spot → /api/v3/klines (现货)
-        is_perp = "-PERP" in instrument_id.upper() or "-PERP" in instrument_id
-        klines_path = "/fapi/v1/klines" if is_perp else "/api/v3/klines"
+        # 根据市场选择 API 端点
+        klines_path = "/fapi/v1/klines" if market == "futures" else "/api/v3/klines"
 
         all_bars: list[Bar] = []
         current_start = start
@@ -439,10 +458,9 @@ class BinanceMarketAdapter:
 
             try:
                 raw_data = await self._exchange_adapter.request(
-                    "GET", klines_path, params=params
+                    "GET", klines_path, params=params, market=market
                 )
             except BrokerBusinessError as e:
-                # 业务错误：记录日志并重新抛出，不做跨市场回退
                 logger.error(
                     "K 线采集失败: %s %s [%s, %s), 错误: %s",
                     instrument_id,
@@ -645,6 +663,7 @@ class BinanceMarketAdapter:
             raise BrokerNetworkError(detail="Market Adapter 未连接")
 
         exchange_symbol = _to_exchange_symbol(instrument_id)
+        market = self._market_of(instrument_id)
 
         all_rates: list[FundingRate] = []
         current_start = start
@@ -663,10 +682,9 @@ class BinanceMarketAdapter:
 
             try:
                 raw_data = await self._exchange_adapter.request(
-                    "GET", "/fapi/v1/fundingRate", params=params
+                    "GET", "/fapi/v1/fundingRate", params=params, market=market
                 )
             except BrokerBusinessError as e:
-                # 业务错误：记录日志并重新抛出，与 K 线路径保持一致
                 logger.error(
                     "资金费率采集失败: %s [%s, %s), 错误: %s",
                     instrument_id,
@@ -677,7 +695,7 @@ class BinanceMarketAdapter:
                 raise
             except Exception as e:
                 logger.error("资金费率采集失败: %s, 错误: %s", instrument_id, e)
-                break
+                raise  # M1.3: 全部 re-raise，禁止 break 静默返回部分数据
 
             if not raw_data or not isinstance(raw_data, list):
                 break
@@ -728,13 +746,16 @@ class BinanceMarketAdapter:
             raw_data = await self._exchange_adapter.request(
                 "GET", "/fapi/v1/openInterest",
                 params={"symbol": exchange_symbol},
+                market=self._market_of(instrument_id),
             )
+            # M1.3: exchange_ts 从 API 响应 time 字段取值（有则用，无则落 received 时间）
+            exchange_ts = datetime.fromtimestamp(int(raw_data.get("time", 0)) / 1000, tz=UTC) if raw_data.get("time") else datetime.now(tz=UTC)
             return OpenInterest(
                 instrument_id=instrument_id,
                 ts=datetime.now(tz=UTC),
                 oi_value=Decimal(str(raw_data["openInterest"])),
                 oi_contracts=Decimal(str(raw_data.get("openInterest", "0"))),
-                exchange_ts=datetime.now(tz=UTC),
+                exchange_ts=exchange_ts,
             )
         except Exception:
             logger.exception("查询持仓量失败: %s", instrument_id)
@@ -745,24 +766,47 @@ class BinanceMarketAdapter:
         instrument_id: str,
         start: datetime,
         end: datetime,
+        period: str = "5m",
     ) -> list[OpenInterest]:
         """采集历史持仓量（自动分页）
 
         Binance API: /futures/data/openInterestHist
         每页最多 1000 条，按时间升序返回。
+        **重要限制**：Binance 只提供最近 1 个月数据。
 
         Args:
             instrument_id: 内部标的 ID
             start: 开始时间
             end: 结束时间
+            period: 数据周期（默认 5m），支持 Binance 允许的周期
 
         Returns:
-            OpenInterest 列表（按时间升序）
+            OpenInterest 列表（按时间升序），附带实际覆盖范围信息
+
+        Raises:
+            BrokerNetworkError: 网络错误
+            BrokerRateLimitError: 限频
+            BrokerBusinessError: 业务错误
         """
         if not self._connected:
             raise BrokerNetworkError(detail="Market Adapter 未连接")
 
         exchange_symbol = _to_exchange_symbol(instrument_id)
+        market = self._market_of(instrument_id)
+
+        # M1.3: OI 历史数据边界校验
+        # Binance /futures/data/openInterestHist 只提供最近 1 个月数据
+        now = datetime.now(tz=UTC)
+        max_start = now - timedelta(days=30)
+
+        if start < max_start:
+            logger.warning(
+                "OI 历史数据请求超出 Binance 可用范围 (最近 1 个月): "
+                "请求 start=%s, 钳制到 %s",
+                start.isoformat(),
+                max_start.isoformat(),
+            )
+            start = max_start
 
         all_oi: list[OpenInterest] = []
         current_start = start
@@ -772,7 +816,7 @@ class BinanceMarketAdapter:
         while current_start < end:
             params: dict[str, Any] = {
                 "symbol": exchange_symbol,
-                "period": "5m",  # 固定 5m 间隔
+                "period": period,
                 "startTime": int(current_start.timestamp() * 1000),
                 "endTime": int(end.timestamp() * 1000),
                 "limit": page_size,
@@ -780,11 +824,11 @@ class BinanceMarketAdapter:
 
             try:
                 raw_data = await self._exchange_adapter.request(
-                    "GET", "/futures/data/openInterestHist", params=params
+                    "GET", "/futures/data/openInterestHist", params=params, market=market
                 )
             except Exception as e:
                 logger.error("历史持仓量采集失败: %s, 错误: %s", instrument_id, e)
-                break
+                raise  # M1.3: 全部 re-raise，禁止 break 静默返回部分数据
 
             if not raw_data or not isinstance(raw_data, list):
                 break
@@ -811,7 +855,17 @@ class BinanceMarketAdapter:
             last_ts = datetime.fromtimestamp(last_item["timestamp"] / 1000, tz=UTC)
             current_start = last_ts + timedelta(minutes=5)
 
-        return sorted(all_oi, key=lambda o: o.ts)
+        result = sorted(all_oi, key=lambda o: o.ts)
+        logger.info(
+            "采集历史持仓量: %s [%s, %s), 共 %d 条 (实际覆盖: %s ~ %s)",
+            instrument_id,
+            start.isoformat(),
+            end.isoformat(),
+            len(result),
+            result[0].ts.isoformat() if result else "N/A",
+            result[-1].ts.isoformat() if result else "N/A",
+        )
+        return result
 
     async def fetch_mark_price(
         self,
@@ -834,13 +888,16 @@ class BinanceMarketAdapter:
             raw_data = await self._exchange_adapter.request(
                 "GET", "/fapi/v1/premiumIndex",
                 params={"symbol": exchange_symbol},
+                market=self._market_of(instrument_id),
             )
+            # M1.3: exchange_ts 从 API 响应 time 字段取值（有则用，无则落 received 时间）
+            exchange_ts = datetime.fromtimestamp(int(raw_data.get("time", 0)) / 1000, tz=UTC) if raw_data.get("time") else datetime.now(tz=UTC)
             return MarkPrice(
                 instrument_id=instrument_id,
                 ts=datetime.now(tz=UTC),
                 mark_price=Decimal(str(raw_data["markPrice"])),
                 index_price=Decimal(str(raw_data.get("indexPrice", "0"))),
-                exchange_ts=datetime.now(tz=UTC),
+                exchange_ts=exchange_ts,
             )
         except Exception:
             logger.exception("查询标记价格失败: %s", instrument_id)

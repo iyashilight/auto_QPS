@@ -7,8 +7,10 @@ exchange:
   primary: binance
   adapters:
     binance:
-      base_url: https://api.binance.com
-      ws_base_url: wss://stream.binance.com:9443
+      base_url: https://api.binance.com                    # 现货 REST
+      ws_base_url: wss://stream.binance.com:9443/ws       # 现货 WS
+      futures_base_url: https://fapi.binance.com           # 永续 REST (M1.3)
+      futures_ws_base_url: wss://fstream.binance.com/ws    # 永续 WS (M1.3)
       testnet: false
       api_key: ${QPS_BINANCE_API_KEY}
       api_secret: ${QPS_BINANCE_API_SECRET}
