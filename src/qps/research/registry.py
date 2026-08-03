@@ -14,6 +14,7 @@ from typing import Any
 
 from qps.core.constants import AssetClass, StrategySource
 from qps.core.errors import DataError
+from qps.core.models.strategy import Strategy, StrategyVersion
 from qps.core.sandbox import Sandbox
 
 
@@ -81,6 +82,7 @@ class StrategyRegistry:
             db_path: 数据库文件路径
         """
         self.db_path = Path(db_path)
+        # 沙箱使用默认白名单，allow_imports 在 save_version 时从 code_pack 提取
         self._sandbox = Sandbox()
         self._init_db()
 
@@ -140,43 +142,60 @@ class StrategyRegistry:
         finally:
             conn.close()
 
-    async def save_version(self, code_pack: StrategyCodePack) -> dict[str, Any]:
+    async def save_version(self, code_pack: dict[str, Any]) -> StrategyVersion:
         """保存策略版本（幂等）
 
         Args:
-            code_pack: 策略代码包
+            code_pack: 策略代码包字典，包含 strategy_id, code_ref, code_content, params_schema 等
 
         Returns:
-            保存的版本信息
+            StrategyVersion 实例
 
         Raises:
             DataError: 保存失败时抛出
         """
+        # 从字典构造内部 StrategyCodePack（用于向后兼容和内部处理）
+        internal_pack = StrategyCodePack(
+            strategy_id=code_pack["strategy_id"],
+            code_ref=code_pack.get("code_ref", "local:unknown"),
+            code_content=code_pack["code_content"],
+            params_schema=code_pack.get("params_schema", {}),
+            data_dependencies=code_pack.get("data_dependencies", []),
+            feature_dependencies=code_pack.get("feature_dependencies", []),
+            runtime_constraints=code_pack.get("runtime_constraints", {}),
+        )
+
         # 1. 检查是否已存在相同 content_hash
-        existing = self._find_by_content_hash(code_pack.strategy_id, code_pack.content_hash)
+        existing = self._find_by_content_hash(internal_pack.strategy_id, internal_pack.content_hash)
         if existing:
             return existing
 
-        # 2. 静态检查
-        sandbox_result = self._sandbox.check(code_pack.code_content)
+        # 2. 静态检查（使用 runtime_constraints.allow_imports 扩展白名单）
+        allowed_modules = set()
+        if internal_pack.runtime_constraints:
+            allowed_modules = set(internal_pack.runtime_constraints.get("allow_imports", []))
+
+        # 创建带自定义白名单的沙箱进行检查
+        check_sandbox = Sandbox(allowed_modules=allowed_modules) if allowed_modules else self._sandbox
+        sandbox_result = check_sandbox.check(internal_pack.code_content)
         if not sandbox_result.passed:
             raise DataError(
                 detail=f"静态检查失败: {json.dumps(sandbox_result.to_dict())}",
             )
 
-        # 3. params_schema 校验
-        from qps.research.yaml_parser import validate_params
+        # 3. params_schema 校验（验证 schema 结构本身）
+        from qps.research.yaml_parser import validate_schema_structure
 
         try:
-            validate_params({}, code_pack.params_schema)
+            validate_schema_structure(internal_pack.params_schema)
         except Exception as e:
             raise DataError(detail=f"params_schema 校验失败: {e}") from e
 
         # 4. 获取或创建策略主记录
-        self._ensure_strategy(code_pack.strategy_id)
+        self._ensure_strategy(internal_pack.strategy_id)
 
         # 5. 获取下一个版本号
-        version_no = self._next_version_no(code_pack.strategy_id)
+        version_no = self._next_version_no(internal_pack.strategy_id)
 
         # 6. 插入版本记录
         conn = self._get_connection()
@@ -189,16 +208,16 @@ class StrategyRegistry:
                     asset_class_support, content_hash, source, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    code_pack.strategy_id,
+                    internal_pack.strategy_id,
                     version_no,
-                    code_pack.code_ref,
-                    json.dumps(code_pack.params_schema),
-                    json.dumps(code_pack.data_dependencies),
-                    json.dumps(code_pack.feature_dependencies),
-                    json.dumps(code_pack.runtime_constraints),
-                    json.dumps([ac.value for ac in code_pack.asset_class_support]),
-                    code_pack.content_hash,
-                    code_pack.source.value,
+                    internal_pack.code_ref,
+                    json.dumps(internal_pack.params_schema),
+                    json.dumps(internal_pack.data_dependencies),
+                    json.dumps(internal_pack.feature_dependencies),
+                    json.dumps(internal_pack.runtime_constraints),
+                    json.dumps([ac.value for ac in internal_pack.asset_class_support]),
+                    internal_pack.content_hash,
+                    internal_pack.source.value,
                     now,
                 ),
             )
@@ -206,14 +225,22 @@ class StrategyRegistry:
         finally:
             conn.close()
 
-        return {
-            "strategy_id": code_pack.strategy_id,
-            "version_no": version_no,
-            "content_hash": code_pack.content_hash,
-            "created_at": now,
-        }
+        # 返回强类型模型
+        return StrategyVersion(
+            strategy_id=internal_pack.strategy_id,
+            version_no=version_no,
+            code_ref=internal_pack.code_ref,
+            params_schema=internal_pack.params_schema,
+            data_dependencies=internal_pack.data_dependencies,
+            feature_dependencies=internal_pack.feature_dependencies,
+            runtime_constraints=internal_pack.runtime_constraints,
+            asset_class_support=internal_pack.asset_class_support,
+            content_hash=internal_pack.content_hash,
+            source=internal_pack.source,
+            created_at=datetime.fromisoformat(now),
+        )
 
-    async def get_version(self, strategy_id: str, version_no: int) -> dict[str, Any]:
+    async def get_version(self, strategy_id: str, version_no: int) -> StrategyVersion:
         """获取策略版本
 
         Args:
@@ -221,7 +248,7 @@ class StrategyRegistry:
             version_no: 版本号
 
         Returns:
-            版本信息
+            StrategyVersion 实例
 
         Raises:
             DataError: 版本不存在时抛出
@@ -237,23 +264,11 @@ class StrategyRegistry:
             if row is None:
                 raise DataError(detail=f"版本不存在: {strategy_id}@{version_no}")
 
-            return {
-                "strategy_id": row["strategy_id"],
-                "version_no": row["version_no"],
-                "code_ref": row["code_ref"],
-                "params_schema": json.loads(row["params_schema"]),
-                "data_dependencies": json.loads(row["data_dependencies"]),
-                "feature_dependencies": json.loads(row["feature_dependencies"]),
-                "runtime_constraints": json.loads(row["runtime_constraints"]),
-                "asset_class_support": json.loads(row["asset_class_support"]),
-                "content_hash": row["content_hash"],
-                "source": row["source"],
-                "created_at": row["created_at"],
-            }
+            return self._row_to_version_model(row)
         finally:
             conn.close()
 
-    async def list_versions(self, strategy_id: str) -> list[dict[str, Any]]:
+    async def list_versions(self, strategy_id: str) -> list[StrategyVersion]:
         """列出策略的所有版本
 
         Args:
@@ -271,21 +286,11 @@ class StrategyRegistry:
                 (strategy_id,),
             ).fetchall()
 
-            return [
-                {
-                    "strategy_id": row["strategy_id"],
-                    "version_no": row["version_no"],
-                    "code_ref": row["code_ref"],
-                    "params_schema": json.loads(row["params_schema"]),
-                    "content_hash": row["content_hash"],
-                    "created_at": row["created_at"],
-                }
-                for row in rows
-            ]
+            return [self._row_to_version_model(row) for row in rows]
         finally:
             conn.close()
 
-    async def list_strategies(self, status: str | None = None) -> list[dict[str, Any]]:
+    async def list_strategies(self, status: str | None = None) -> list[Strategy]:
         """列出所有策略
 
         Args:
@@ -309,24 +314,46 @@ class StrategyRegistry:
                        ORDER BY created_at DESC"""
                 ).fetchall()
 
-            return [
-                {
-                    "strategy_id": row["strategy_id"],
-                    "name": row["name"],
-                    "description": row["description"],
-                    "style": row["style"],
-                    "lifecycle_status": row["lifecycle_status"],
-                    "tags": json.loads(row["tags"]) if row["tags"] else [],
-                    "source": row["source"],
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                }
-                for row in rows
-            ]
+            return [self._row_to_strategy_model(row) for row in rows]
         finally:
             conn.close()
 
-    def _find_by_content_hash(self, strategy_id: str, content_hash: str) -> dict[str, Any] | None:
+    def _row_to_version_model(self, row: sqlite3.Row) -> StrategyVersion:
+        """将数据库行转换为 StrategyVersion 模型"""
+        from qps.core.constants import AssetClass, StrategySource
+
+        return StrategyVersion(
+            strategy_id=row["strategy_id"],
+            version_no=row["version_no"],
+            code_ref=row["code_ref"],
+            params_schema=json.loads(row["params_schema"]),
+            data_dependencies=json.loads(row["data_dependencies"]),
+            feature_dependencies=json.loads(row["feature_dependencies"]),
+            runtime_constraints=json.loads(row["runtime_constraints"]),
+            asset_class_support=[AssetClass(ac) for ac in json.loads(row["asset_class_support"])],
+            content_hash=row["content_hash"],
+            source=StrategySource(row["source"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def _row_to_strategy_model(self, row: sqlite3.Row) -> Strategy:
+        """将数据库行转换为 Strategy 模型"""
+        from qps.core.constants import StrategyLifecycleStatus, StrategySource, StrategyStyle
+
+        return Strategy(
+            strategy_id=row["strategy_id"],
+            name=row["name"],
+            description=row["description"],
+            style=StrategyStyle(row["style"]),
+            lifecycle_status=StrategyLifecycleStatus(row["lifecycle_status"]),
+            tags=json.loads(row["tags"]) if row["tags"] else [],
+            account_binding=row["account_binding"],
+            source=StrategySource(row["source"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def _find_by_content_hash(self, strategy_id: str, content_hash: str) -> StrategyVersion | None:
         """根据 content_hash 查找版本（用于幂等）"""
         conn = self._get_connection()
         try:
@@ -337,12 +364,7 @@ class StrategyRegistry:
             ).fetchone()
 
             if row:
-                return {
-                    "strategy_id": row["strategy_id"],
-                    "version_no": row["version_no"],
-                    "content_hash": row["content_hash"],
-                    "created_at": row["created_at"],
-                }
+                return self._row_to_version_model(row)
             return None
         finally:
             conn.close()

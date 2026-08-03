@@ -187,3 +187,36 @@ def validate_params(params: dict[str, Any], schema: dict[str, Any]) -> None:
     errors = validator.validate()
     if errors:
         raise SchemaValidationError(errors)
+
+
+def validate_schema_structure(schema: dict[str, Any]) -> None:
+    """校验 params_schema 结构本身是否合法（不验证具体参数值）
+
+    Args:
+        schema: JSON Schema 字典
+
+    Raises:
+        SchemaValidationError: schema 结构非法时抛出
+    """
+    errors: list[str] = []
+
+    # 检查顶层 type
+    if schema.get("type") != "object":
+        errors.append("schema.type 必须是 object")
+
+    # 检查 properties 存在且为字典
+    properties = schema.get("properties")
+    if properties is not None and not isinstance(properties, dict):
+        errors.append("schema.properties 必须是字典")
+
+    # 检查每个 property 的 type 是否合法
+    valid_types = {"integer", "number", "string", "boolean", "array", "object"}
+    if isinstance(properties, dict):
+        for prop_name, prop_schema in properties.items():
+            if isinstance(prop_schema, dict):
+                prop_type = prop_schema.get("type")
+                if prop_type and prop_type not in valid_types:
+                    errors.append(f"属性 {prop_name}.type 必须是有效类型之一: {valid_types}")
+
+    if errors:
+        raise SchemaValidationError(errors)

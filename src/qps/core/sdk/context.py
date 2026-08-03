@@ -374,4 +374,4 @@ class StrategyContext:
         """当前时间（回测时由框架注入，实盘时为系统时间）"""
         if self._current_time is not None:
             return self._current_time
-        return datetime.utcnow()
+        return datetime.now(UTC)
