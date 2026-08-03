@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any
 
 from qps.core.models.instrument import CalendarBreak, ExchangeCalendar
 
@@ -225,8 +224,18 @@ class ExchangeCalendarManager:
         breaks: list[CalendarBreak] = []
 
         for window in windows:
-            start = datetime.fromisoformat(window["start"])
-            end = datetime.fromisoformat(window["end"])
+            # 确保解析后的 datetime 是 tz-aware（UTC）
+            start_raw = datetime.fromisoformat(window["start"])
+            end_raw = datetime.fromisoformat(window["end"])
+
+            # 如果解析结果是 naive，添加 UTC 时区
+            if start_raw.tzinfo is None:
+                start_raw = start_raw.replace(tzinfo=UTC)
+            if end_raw.tzinfo is None:
+                end_raw = end_raw.replace(tzinfo=UTC)
+
+            start = start_raw
+            end = end_raw
 
             # 检查是否与该日期重叠
             day_start = datetime.combine(d, time.min, tzinfo=UTC)

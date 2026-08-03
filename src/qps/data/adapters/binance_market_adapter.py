@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from qps.core.constants import DataQuality
-from qps.core.errors import BrokerBusinessError, BrokerNetworkError, BrokerRateLimitError
+from qps.core.errors import BrokerBusinessError, BrokerNetworkError
 from qps.core.models.adapter import AdapterStatus
 from qps.core.models.market import Bar, FundingRate, MarkPrice, OpenInterest
 
@@ -394,7 +394,7 @@ class BinanceMarketAdapter:
         """采集历史 K 线数据（自动分页）
 
         Args:
-            instrument_id: 内部标的 ID
+            instrument_id: 内部标的 ID（如 binance-btc-usdt-perp 或 binance-btc-usdt）
             interval: K 线间隔
             start: 开始时间
             end: 结束时间
@@ -419,6 +419,12 @@ class BinanceMarketAdapter:
         exchange_symbol = _to_exchange_symbol(instrument_id)
         binance_interval = _INTERVAL_MAP[interval]
 
+        # 根据 instrument_id 类型选择 API 端点
+        # PERP → /fapi/v1/klines (永续合约)
+        # spot → /api/v3/klines (现货)
+        is_perp = "-PERP" in instrument_id.upper() or "-PERP" in instrument_id
+        klines_path = "/fapi/v1/klines" if is_perp else "/api/v3/klines"
+
         all_bars: list[Bar] = []
         current_start = start
 
@@ -433,13 +439,19 @@ class BinanceMarketAdapter:
 
             try:
                 raw_data = await self._exchange_adapter.request(
-                    "GET", "/fapi/v1/klines", params=params
+                    "GET", klines_path, params=params
                 )
-            except BrokerBusinessError:
-                # 尝试现货 API
-                raw_data = await self._exchange_adapter.request(
-                    "GET", "/api/v3/klines", params=params
+            except BrokerBusinessError as e:
+                # 业务错误：记录日志并重新抛出，不做跨市场回退
+                logger.error(
+                    "K 线采集失败: %s %s [%s, %s), 错误: %s",
+                    instrument_id,
+                    interval,
+                    start.isoformat(),
+                    end.isoformat(),
+                    e.detail,
                 )
+                raise
 
             if not raw_data or not isinstance(raw_data, list):
                 break
@@ -619,7 +631,7 @@ class BinanceMarketAdapter:
         start: datetime,
         end: datetime,
     ) -> list[FundingRate]:
-        """采集历史资金费率
+        """采集历史资金费率（自动分页）
 
         Args:
             instrument_id: 内部标的 ID
@@ -634,35 +646,56 @@ class BinanceMarketAdapter:
 
         exchange_symbol = _to_exchange_symbol(instrument_id)
 
-        params: dict[str, Any] = {
-            "symbol": exchange_symbol,
-            "startTime": int(start.timestamp() * 1000),
-            "endTime": int(end.timestamp() * 1000),
-            "limit": 1000,
-        }
+        all_rates: list[FundingRate] = []
+        current_start = start
 
-        raw_data = await self._exchange_adapter.request(
-            "GET", "/fapi/v1/fundingRate", params=params
-        )
+        # Binance funding rate API 每页最多 1000 条
+        # 8h 费率约 333 天/1000 条，超过需分页
+        page_size = 1000
 
-        if not raw_data or not isinstance(raw_data, list):
-            return []
+        while current_start < end:
+            params: dict[str, Any] = {
+                "symbol": exchange_symbol,
+                "startTime": int(current_start.timestamp() * 1000),
+                "endTime": int(end.timestamp() * 1000),
+                "limit": page_size,
+            }
 
-        results: list[FundingRate] = []
-        for item in raw_data:
             try:
-                fr = FundingRate(
-                    instrument_id=instrument_id,
-                    funding_ts=datetime.fromtimestamp(item["fundingTime"] / 1000, tz=UTC),
-                    rate=Decimal(str(item["fundingRate"])),
-                    interval="8h",
+                raw_data = await self._exchange_adapter.request(
+                    "GET", "/fapi/v1/fundingRate", params=params
                 )
-                results.append(fr)
-            except Exception:
-                logger.exception("解析资金费率数据失败")
-                continue
+            except Exception as e:
+                logger.error("资金费率采集失败: %s, 错误: %s", instrument_id, e)
+                break
 
-        return results
+            if not raw_data or not isinstance(raw_data, list):
+                break
+
+            # 解析结果
+            for item in raw_data:
+                try:
+                    fr = FundingRate(
+                        instrument_id=instrument_id,
+                        funding_ts=datetime.fromtimestamp(item["fundingTime"] / 1000, tz=UTC),
+                        rate=Decimal(str(item["fundingRate"])),
+                        interval="8h",
+                    )
+                    all_rates.append(fr)
+                except Exception:
+                    logger.exception("解析资金费率数据失败")
+                    continue
+
+            # 如果返回数量少于请求数量，说明已到末尾
+            if len(raw_data) < page_size:
+                break
+
+            # 更新下一页起始时间（最后一条的 funding_time + 8h）
+            last_item = raw_data[-1]
+            last_ts = datetime.fromtimestamp(last_item["fundingTime"] / 1000, tz=UTC)
+            current_start = last_ts + timedelta(hours=8)
+
+        return sorted(all_rates, key=lambda r: r.funding_ts)
 
     async def fetch_open_interest(
         self,

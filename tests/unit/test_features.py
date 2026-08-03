@@ -88,12 +88,17 @@ class TestFeatureRegistry:
         assert latest.name == "returns"
 
     def test_register_same_name_creates_new_version(self) -> None:
-        """同名特征再次注册创建新版本"""
+        """同名特征再次注册创建新版本（参数不同时）"""
         registry = FeatureRegistry()
-        v1 = registry.register("returns", feature_returns, 2, {})
-        v2 = registry.register("returns", feature_returns, 3, {})
-        assert v1 != v2
-        assert registry.get_latest("returns").version == v2
+        # 相同函数、相同参数 → 相同版本号（内容哈希）
+        v1 = registry.register("returns", feature_returns, 2, {"period": 10})
+        v2 = registry.register("returns", feature_returns, 3, {"period": 10})
+        assert v1 == v2  # 相同参数产生相同版本号
+
+        # 不同参数 → 不同版本号
+        v3 = registry.register("returns", feature_returns, 4, {"period": 20})
+        assert v1 != v3
+        assert registry.get_latest("returns").version == v3
 
     def test_list_versions(self) -> None:
         """列出所有版本"""

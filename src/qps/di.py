@@ -143,7 +143,7 @@ def build_container(config: Config) -> Container:
         rate_limit = binance_config.get("rate_limit", {})
         rest_per_sec = rate_limit.get("rest_per_sec", 10) if isinstance(rate_limit, dict) else 10
     else:
-        base_url = getattr(binance_config, "base_url", "https://api.b2inance.com")
+        base_url = getattr(binance_config, "base_url", "https://api.binance.com")
         ws_base_url = getattr(binance_config, "ws_base_url", "wss://stream.binance.com:9443")
         testnet = getattr(binance_config, "testnet", False)
         rest_per_sec = 10

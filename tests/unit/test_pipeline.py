@@ -94,7 +94,7 @@ class TestRawWriter:
         assert len(files) == 2
 
     def test_write_bars_no_overwrite(self, tmp_path: Path) -> None:
-        """已有分区不覆盖（只增不改）"""
+        """已有分区不覆盖（skip 模式）"""
         raw_dir = tmp_path / "raw"
         writer = RawWriter(raw_dir=raw_dir, source="binance")
 
@@ -104,9 +104,13 @@ class TestRawWriter:
         files1 = writer.write_bars("btcusdt-perp", bars)
         assert len(files1) == 1
 
-        # 第二次写入相同日期（应跳过）
-        files2 = writer.write_bars("btcusdt-perp", bars)
+        # 第二次写入相同日期（skip 模式应跳过）
+        files2 = writer.write_bars("btcusdt-perp", bars, mode="skip")
         assert len(files2) == 0
+
+        # append 模式应合并去重
+        files3 = writer.write_bars("btcusdt-perp", bars, mode="append")
+        assert len(files3) == 1  # 返回已存在的文件路径
 
     def test_write_bars_empty(self, tmp_path: Path) -> None:
         """空数据不写入"""

@@ -13,16 +13,13 @@ import logging
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import polars as pl
 
 from qps.core.constants import DataQuality
 from qps.core.errors import DataError
-from qps.core.models.market import Bar, FundingRate, MarkPrice, OpenInterest
-
-if TYPE_CHECKING:
-    pass
+from qps.core.models.market import Bar, FundingRate
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +101,7 @@ class RawWriter:
         symbol: str,
         bars: list[Bar],
         batch_id: str | None = None,
+        mode: str = "append",
     ) -> list[Path]:
         """写入 K 线数据到 Raw 层
 
@@ -113,6 +111,7 @@ class RawWriter:
             symbol: 交易所符号（如 btcusdt-perp）
             bars: K 线数据列表
             batch_id: 批次 ID（用于 data_version）
+            mode: 写入模式 - 'append'（追加，默认）、'overwrite'（覆盖）、'skip'（跳过已有）
 
         Returns:
             写入的文件路径列表
@@ -132,15 +131,29 @@ class RawWriter:
         data_version = self._make_data_version(batch_id)
 
         written_files: list[Path] = []
+
         for d, day_bars in sorted(by_date.items()):
             partition_dir = self._raw_dir / symbol / "klines" / d.isoformat()
             partition_dir.mkdir(parents=True, exist_ok=True)
 
-            # 检查是否已存在（只增不改）
             existing_file = partition_dir / "part-000.parquet"
+
             if existing_file.exists():
-                logger.debug("Raw 分区已存在，跳过: %s", existing_file)
-                continue
+                if mode == "skip":
+                    logger.debug("Raw 分区已存在，跳过: %s", existing_file)
+                    continue
+                elif mode == "append":
+                    # 追加模式：读取已有数据，合并后去重
+                    existing_df = pl.read_parquet(existing_file)
+                    new_df = self._bars_to_dataframe(day_bars, data_version)
+                    # 按 open_time 去重，保留最新的
+                    merged = pl.concat([existing_df, new_df])
+                    merged = merged.sort("open_time").unique(subset=["open_time"], keep="last")
+                    merged.write_parquet(existing_file)
+                    written_files.append(existing_file)
+                    logger.debug("追加 Raw K 线: %s (%d bars)", existing_file, len(merged))
+                    continue
+                # overwrite 模式继续执行
 
             # 转为 Polars DataFrame
             df = self._bars_to_dataframe(day_bars, data_version)
@@ -353,6 +366,7 @@ class Normalizer:
         bars: list[Bar],
         instrument_id: str,
         interval: str,
+        mode: str = "merge",
     ) -> Path:
         """写入 Normalized K 线数据
 
@@ -362,6 +376,7 @@ class Normalizer:
             bars: 规范化后的 K 线列表
             instrument_id: 内部标的 ID
             interval: K 线间隔
+            mode: 写入模式 - 'merge'（合并去重，默认）、'overwrite'（覆盖）、'append'（追加）
 
         Returns:
             写入的文件路径
@@ -369,45 +384,79 @@ class Normalizer:
         if not bars:
             raise DataError(detail="无数据可写入")
 
-        # 按年分组
-        by_year: dict[int, list[Bar]] = {}
-        for bar in bars:
-            year = bar.open_time.year
-            by_year.setdefault(year, []).append(bar)
-
         # 使用 instrument_id 中的符号部分作为目录名
         # 如 binance-btc-usdt-perp → btc-usdt-perp
         symbol_dir = instrument_id.split("-", 1)[-1] if "-" in instrument_id else instrument_id
 
         last_path: Path | None = None
+
+        # 按年分组处理
+        by_year: dict[int, list[Bar]] = {}
+        for bar in bars:
+            year = bar.open_time.year
+            by_year.setdefault(year, []).append(bar)
+
         for year, year_bars in sorted(by_year.items()):
             out_dir = self._normalized_dir / interval / symbol_dir
             out_dir.mkdir(parents=True, exist_ok=True)
 
             out_path = out_dir / f"{year}.parquet"
 
-            rows = [
-                {
-                    "instrument_id": bar.instrument_id,
-                    "open_time": bar.open_time.isoformat(),
-                    "interval": bar.interval,
-                    "open": str(bar.open),
-                    "high": str(bar.high),
-                    "low": str(bar.low),
-                    "close": str(bar.close),
-                    "volume": str(bar.volume),
-                    "quote_volume": str(bar.quote_volume),
-                    "taker_buy_volume": str(bar.taker_buy_volume),
-                    "trades_count": bar.trades_count,
-                    "data_version": bar.data_version,
-                    "quality": bar.quality.value,
-                }
-                for bar in year_bars
-            ]
-            df = pl.DataFrame(rows)
-            df.write_parquet(out_path)
-            last_path = out_path
-            logger.debug("写入 Normalized K 线: %s (%d bars)", out_path, len(year_bars))
+            if out_path.exists() and mode == "merge":
+                # 合并模式：读取已有数据，合并后去重
+                existing_df = pl.read_parquet(out_path)
+                new_rows = [
+                    {
+                        "instrument_id": bar.instrument_id,
+                        "open_time": bar.open_time.isoformat(),
+                        "interval": bar.interval,
+                        "open": str(bar.open),
+                        "high": str(bar.high),
+                        "low": str(bar.low),
+                        "close": str(bar.close),
+                        "volume": str(bar.volume),
+                        "quote_volume": str(bar.quote_volume),
+                        "taker_buy_volume": str(bar.taker_buy_volume),
+                        "trades_count": bar.trades_count,
+                        "data_version": bar.data_version,
+                        "quality": bar.quality.value,
+                    }
+                    for bar in year_bars
+                ]
+                new_df = pl.DataFrame(new_rows)
+                # 按 open_time 去重，保留最新的（通过 data_version 判断）
+                merged = pl.concat([existing_df, new_df])
+                merged = merged.sort("open_time").unique(subset=["open_time"], keep="last")
+                merged.write_parquet(out_path)
+                last_path = out_path
+                logger.debug("合并 Normalized K 线: %s (%d bars)", out_path, len(merged))
+            else:
+                # 覆盖或追加模式
+                rows = [
+                    {
+                        "instrument_id": bar.instrument_id,
+                        "open_time": bar.open_time.isoformat(),
+                        "interval": bar.interval,
+                        "open": str(bar.open),
+                        "high": str(bar.high),
+                        "low": str(bar.low),
+                        "close": str(bar.close),
+                        "volume": str(bar.volume),
+                        "quote_volume": str(bar.quote_volume),
+                        "taker_buy_volume": str(bar.taker_buy_volume),
+                        "trades_count": bar.trades_count,
+                        "data_version": bar.data_version,
+                        "quality": bar.quality.value,
+                    }
+                    for bar in year_bars
+                ]
+                df = pl.DataFrame(rows)
+                if mode == "append" and out_path.exists():
+                    existing_df = pl.read_parquet(out_path)
+                    df = pl.concat([existing_df, df])
+                df.write_parquet(out_path)
+                last_path = out_path
+                logger.debug("写入 Normalized K 线: %s (%d bars)", out_path, len(year_bars))
 
         if last_path is None:
             raise DataError(detail="无数据可写入")

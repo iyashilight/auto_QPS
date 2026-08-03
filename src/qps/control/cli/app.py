@@ -77,6 +77,9 @@ def data_collect(
     start: str | None = typer.Option(None, "--start", help="开始日期 (YYYY-MM-DD)"),
     end: str | None = typer.Option(None, "--end", help="结束日期 (YYYY-MM-DD)"),
     json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
+    with_funding: bool = typer.Option(False, "--with-funding", help="同时采集资金费率"),
+    with_oi: bool = typer.Option(False, "--with-oi", help="同时采集持仓量"),
+    mode: str = typer.Option("append", "--mode", "-m", help="写入模式: append/overwrite/skip"),
 ) -> None:
     """历史数据采集（异步任务，进度可查）"""
     from qps.broker.exchange_adapter.binance_exchange_adapter import BinanceExchangeAdapter
@@ -97,6 +100,11 @@ def data_collect(
     except ValueError as e:
         typer.echo(f"❌ 日期格式错误: {e}", err=True)
         raise typer.Exit(code=2) from e
+
+    # 验证日期范围
+    if start_dt >= end_dt:
+        typer.echo("❌ start 必须早于 end", err=True)
+        raise typer.Exit(code=2)
 
     instrument_id = _make_instrument_id(instrument)
 
@@ -128,12 +136,31 @@ def data_collect(
             data_dir = _get_data_dir()
             raw_writer = RawWriter(raw_dir=data_dir / "raw", source="binance")
             symbol = instrument.lower().replace("-", "")
-            raw_files = raw_writer.write_bars(symbol, bars)
+            raw_files = raw_writer.write_bars(symbol, bars, mode=mode)
 
             # Normalized
             normalizer = Normalizer(normalized_dir=data_dir / "normalized")
             normalized, report = normalizer.normalize_bars(bars, instrument_id, interval)
-            norm_path = normalizer.write_normalized_bars(normalized, instrument_id, interval)
+            norm_path = normalizer.write_normalized_bars(normalized, instrument_id, interval, mode=mode)
+
+            # 采集资金费率
+            funding_count = 0
+            if with_funding:
+                typer.echo(f"💰 采集 {instrument} 资金费率...")
+                funding_rates = await market_adapter.fetch_funding_rates(instrument_id, start_dt, end_dt)
+                if funding_rates:
+                    raw_writer.write_funding_rates(symbol, funding_rates)
+                    funding_count = len(funding_rates)
+                    typer.echo(f"   资金费率: {funding_count} 条")
+
+            # 采集持仓量
+            oi_count = 0
+            if with_oi:
+                typer.echo(f"📈 采集 {instrument} 持仓量...")
+                oi = await market_adapter.fetch_open_interest(instrument_id)
+                if oi:
+                    oi_count = 1
+                    typer.echo(f"   持仓量: {oi.oi_value}")
 
             # 输出结果
             if json_output:
@@ -149,6 +176,8 @@ def data_collect(
                     "quality_report": report.to_dict(),
                     "raw_files": [str(f) for f in raw_files],
                     "normalized_file": str(norm_path) if norm_path else None,
+                    "funding_rates_collected": funding_count,
+                    "oi_collected": oi_count,
                 }
                 typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
             else:
@@ -160,6 +189,10 @@ def data_collect(
                     typer.echo(f"   缺口: {len(report.gaps)} 个")
                 if report.suspect_bars > 0:
                     typer.echo(f"   可疑数据: {report.suspect_bars} 根")
+                if funding_count > 0:
+                    typer.echo(f"   资金费率: {funding_count} 条")
+                if oi_count > 0:
+                    typer.echo("   持仓量: 已采集")
 
         except Exception as e:
             typer.echo(f"❌ 采集失败: {e}", err=True)
@@ -184,8 +217,18 @@ def data_verify(
     instrument_id = _make_instrument_id(instrument)
     data_dir = _get_data_dir()
 
-    start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=UTC) if start else datetime(2020, 1, 1, tzinfo=UTC)
-    end_dt = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=UTC) if end else datetime.now(tz=UTC)
+    # 验证 K 线间隔
+    valid_intervals = ("1m", "5m", "15m", "1h")
+    if interval not in valid_intervals:
+        typer.echo(f"❌ 不支持的 K 线间隔: {interval}，支持: {valid_intervals}", err=True)
+        raise typer.Exit(code=2)
+
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=UTC) if start else datetime(2020, 1, 1, tzinfo=UTC)
+        end_dt = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=UTC) if end else datetime.now(tz=UTC)
+    except ValueError as e:
+        typer.echo(f"❌ 日期格式错误: {e}", err=True)
+        raise typer.Exit(code=2) from e
 
     checker = QualityChecker(normalized_dir=data_dir / "normalized")
     report = checker.check_bars(instrument_id, interval, start_dt, end_dt)
@@ -201,6 +244,131 @@ def data_verify(
         typer.echo(f"   乱序: {report.out_of_order} 条")
         typer.echo(f"   价格跳变: {len(report.price_jumps)} 处")
         typer.echo(f"   整体质量: {report.overall_quality.value}")
+
+
+@data_app.command("compute")
+def data_compute(
+    instrument: str = typer.Argument(help="标的符号，如 BTC-USDT-PERP"),
+    interval: str = typer.Option("5m", "--interval", "-i", help="K 线间隔"),
+    start: str | None = typer.Option(None, "--start", help="开始日期 (YYYY-MM-DD)"),
+    end: str | None = typer.Option(None, "--end", help="结束日期 (YYYY-MM-DD)"),
+    features: str = typer.Option("returns,momentum_10,atr_14,realized_vol_20,volume_change", "--features", "-f", help="特征列表（逗号分隔）"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
+    check_mode: str = typer.Option("structural", "--check-mode", help="未来函数校验模式: structural/strict/none"),
+) -> None:
+    """计算特征数据"""
+    from qps.broker.exchange_adapter.binance_exchange_adapter import BinanceExchangeAdapter
+    from qps.data.adapters.binance_market_adapter import BinanceMarketAdapter
+    from qps.data.features.engine import FeatureEngine, register_mvp_features
+    from qps.data.pipeline.normalizer import Normalizer
+
+    # 解析日期
+    if start is None:
+        typer.echo("❌ 必须指定 --start 日期", err=True)
+        raise typer.Exit(code=2)
+    if end is None:
+        typer.echo("❌ 必须指定 --end 日期", err=True)
+        raise typer.Exit(code=2)
+
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=UTC)
+        end_dt = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError as e:
+        typer.echo(f"❌ 日期格式错误: {e}", err=True)
+        raise typer.Exit(code=2) from e
+
+    if start_dt >= end_dt:
+        typer.echo("❌ start 必须早于 end", err=True)
+        raise typer.Exit(code=2)
+
+    instrument_id = _make_instrument_id(instrument)
+
+    # 验证 K 线间隔
+    valid_intervals = ("1m", "5m", "15m", "1h")
+    if interval not in valid_intervals:
+        typer.echo(f"❌ 不支持的 K 线间隔: {interval}，支持: {valid_intervals}", err=True)
+        raise typer.Exit(code=2)
+
+    # 解析特征列表
+    feature_names = [f.strip() for f in features.split(",")]
+
+    async def _compute() -> None:
+        # 创建适配器
+        exchange_adapter = BinanceExchangeAdapter()
+        market_adapter = BinanceMarketAdapter(exchange_adapter=exchange_adapter)
+
+        try:
+            await market_adapter.connect()
+
+            # 采集历史 K 线
+            typer.echo(f"📊 采集 {instrument} {interval} K 线 [{start}, {end})...")
+            bars = await market_adapter.fetch_historical_bars(
+                instrument_id, interval, start_dt, end_dt
+            )
+
+            if not bars:
+                typer.echo("⚠️  未采集到数据", err=True)
+                return
+
+            # 规范化
+            data_dir = _get_data_dir()
+            normalizer = Normalizer(normalized_dir=data_dir / "normalized")
+            normalized, report = normalizer.normalize_bars(bars, instrument_id, interval)
+
+            # 计算特征
+            typer.echo(f"🔬 计算特征: {', '.join(feature_names)}...")
+            engine = FeatureEngine(
+                features_dir=data_dir / "features",
+                data_version="binance-default",
+            )
+            register_mvp_features(engine)
+
+            features_result = engine.compute_with_bars(
+                instrument_id, interval, feature_names, normalized, check_mode=check_mode
+            )
+
+            # 落盘特征
+            if features_result:
+                feature_version = engine.list_versions(feature_names[0])[-1] if feature_names else "unknown"
+                feature_path = engine.write_features(features_result, feature_version, interval, instrument_id)
+
+                if json_output:
+                    result = {
+                        "instrument": instrument,
+                        "instrument_id": instrument_id,
+                        "interval": interval,
+                        "start": start,
+                        "end": end,
+                        "bars_used": len(normalized),
+                        "features_computed": len(features_result),
+                        "feature_version": feature_version,
+                        "feature_file": str(feature_path) if feature_path else None,
+                        "features": [
+                            {
+                                "ts": f.ts.isoformat(),
+                                "name": f.feature_name,
+                                "value": float(f.value),
+                                "version": f.feature_version,
+                            }
+                            for f in features_result[:100]  # 限制输出数量
+                        ],
+                    }
+                    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+                else:
+                    typer.echo(f"✅ 特征计算完成: {len(features_result)} 个特征值")
+                    typer.echo(f"   特征版本: {feature_version}")
+                    typer.echo(f"   特征文件: {feature_path}")
+                    typer.echo(f"   数据质量: {report.overall_quality.value}")
+            else:
+                typer.echo("⚠️  无特征计算结果")
+
+        except Exception as e:
+            typer.echo(f"❌ 特征计算失败: {e}", err=True)
+            raise typer.Exit(code=1) from e
+        finally:
+            await market_adapter.disconnect()
+
+    asyncio.run(_compute())
 
 
 @data_app.command("status")
