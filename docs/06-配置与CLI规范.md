@@ -65,6 +65,32 @@ risk:
     max_daily_loss: 500
     max_total_drawdown: 0.15
     max_combined_leverage: 3
+  mode:                        # 风险模式状态机（架构 §8.5）
+    hysteresis:
+      observe_minutes: 120     # 事件撤回后的观察窗口
+      require_volatility_drop: true   # 需波动率回落才逐级恢复
+      recover_stepwise: true   # DEFENSIVE → CAUTION → NORMAL
+    news_events:               # 事件 → 模式/动作 静态映射表（确定性入口）
+      - type: EXCHANGE_HACK
+        min_severity: 7
+        min_confidence: 0.7
+        mode: DEFENSIVE
+        actions: [disable_new_positions, leverage_limit:1]
+      - type: EXCHANGE_STATUS
+        min_severity: 6
+        min_confidence: 0.8
+        mode: CAUTION
+        actions: [disable_new_positions]
+      - type: REGULATORY_RISK
+        min_severity: 6
+        min_confidence: 0.6
+        mode: CAUTION
+        actions: [disable_new_positions]
+      - type: MAINTENANCE
+        min_severity: 4
+        min_confidence: 0.8
+        mode: NORMAL
+        actions: []
   strategy_defaults:
     max_position_notional: 2000
     max_daily_loss: 200
@@ -76,6 +102,25 @@ risk:
   market:
     max_latency_ms: 500
     freeze_on_ws_disconnect: true
+
+news:                          # 规则版新闻管线（M5/M6，无 LLM）
+  enabled: false               # M5 开启（Paper 模拟），M6 接真实源
+  sources:
+    - name: binance_announcement
+      kind: L1_OFFICIAL
+      poll_seconds: 30
+    - name: coindesk_rss
+      kind: L2_RSS
+      poll_seconds: 90
+    - name: cointelegraph_rss
+      kind: L2_RSS
+      poll_seconds: 90
+  confidence_priors:           # 分层置信度先验（架构 §2.7.4）
+    L1_OFFICIAL: 0.9
+    L2_RSS: 0.6
+    L3_SOCIAL: 0.3
+  cross_source_bonus: 0.1      # 多源一致加成（封顶 1.0）
+  latency_target_ms: 60000     # 事件 → 风险模式切换延迟目标 < 1min
 
 portfolio:
   mode: multi_strategy
@@ -151,8 +196,13 @@ qps
 │   └── deploy <strategy_id> --mode paper|production --params JSON
 ├── risk
 │   ├── status
+│   ├── mode [--account]                                   # 查看风险模式与切换历史
 │   ├── freeze [--strategy <id>|--all]
 │   └── unfreeze <strategy_id|all> --confirm
+├── news
+│   ├── inject <json> --account paper_001 [--confirm]      # 仅 Paper：注入合成新闻事件（测试链路）
+│   ├── status                                             # 新闻源连接与最近事件
+│   └── events [--active]                                  # 查看活动事件（CANDIDATE/CONFIRMED 未过期）
 ├── task
 │   ├── list
 │   └── cancel <task_id>
@@ -165,6 +215,7 @@ qps
 - 默认表格输出（rich/plain）；`--json` 输出机器可读 JSON（供脚本/AI 消费）；
 - 退出码：`0` 成功；`1` 业务失败（含原因输出）；`2` 参数错误；`3` 风控/权限拒绝；
 - 所有修改类命令（promote/freeze/unfreeze/deploy）必须二次确认（`--confirm`）并写 AuditLog；
+- `qps news inject` 仅允许在 Paper 账户执行（实盘账户拒绝，退出码 3）；`risk mode` 为只读命令，HALT 恢复只能走 `unfreeze --all`（人工）；
 - 未登录/密钥缺失 → 明确报错并提示设置环境变量，禁止静默降级。
 
 ## 5. CLI 示例（验收形态）

@@ -13,11 +13,12 @@ models/
 ├── instrument.py    # Instrument, SymbolMapping, ExchangeMeta, ExchangeCalendar, CalendarBreak
 ├── market.py        # Bar, Tick, OrderBookSnapshot, FundingRate, OpenInterest, MarkPrice, FeatureSet
 ├── adapter.py       # AdapterStatus
+├── news.py          # NewsEvent, NewsSourceRef, NewsEventType/State/Direction（M5/M6 规则版，M7 LLM 增强）
 ├── strategy.py      # Strategy, StrategyVersion, StrategyParams, Deployment
-├── intent.py        # TradingIntent
+├── intent.py        # TradingIntent, CoordinatorIntent（战略层投资意图）
 ├── order.py         # Order, Trade
 ├── account.py       # Account, Position, Snapshot, StrategyAllocation, PortfolioRisk
-├── risk.py          # RiskRule, RiskCheckResult, RiskEvent
+├── risk.py          # RiskRule, RiskCheckResult, RiskEvent, RiskModeSnapshot, RiskMode
 ├── experiment.py    # BacktestRun, OptimizationRun, ReportCard, Metrics
 ├── task.py          # TaskRun
 ├── audit.py         # AuditLog
@@ -293,17 +294,67 @@ models/
 
 **RiskEvent**：`event_id` 唯一；字段 `event_type(BREACH/COOLDOWN/FREEZE/KILLSWITCH), severity, context(dict), triggered_at, action_taken`
 
+**RiskMode**（枚举）：`NORMAL / CAUTION / DEFENSIVE / HALT`（账户级运行姿态，状态机见架构文档 §8.5）
+
+**RiskModeSnapshot**：`snapshot_id` 唯一；字段 `account_id, mode(RiskMode), entered_at(UTC), triggered_by(NEWS_EVENT/MARKET_ANOMALY/PORTFOLIO_RISK/MANUAL), reason, event_ref?`（每次模式切换落一条，不可变）
+
 **AuditLog**：`log_id` 唯一；字段 `actor(MAN/AGENT/SYSTEM), action, target_type, target_id, before, after, ts, reason`
 
 **TaskRun**：`task_id` 唯一；字段 `task_type, params, status(PENDING/RUNNING/SUCCEEDED/FAILED/CANCELED), started_at, finished_at, error?`
 
-**Artifact**（M6）：`artifact_id` 唯一；字段 `artifact_type, schema_version, content(dict), strategy_id?, run_id?, agent_role?, created_at`（不可变）
+**Artifact**（M7）：`artifact_id` 唯一；字段 `artifact_type, schema_version, content(dict), strategy_id?, run_id?, agent_role?, created_at`（不可变）
+
+### 3.8 新闻事件与 Agent 工件
+
+> 设计背景见架构文档 §2.7。规则版（M5/M6）只产出规则可识别的结构化事件；LLM 版（M7）扩展非结构化理解，schema 不变。
+
+**NewsSourceRef**：新闻来源引用（多源交叉验证）
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| name | str | 是 | 来源名，如 `Binance Announcement` / `CoinDesk` |
+| url | str | 否 | 原文链接 |
+| time | datetime | 是 | 源发布时间（UTC） |
+| tier | enum | 是 | `L1_OFFICIAL` / `L2_RSS` / `L3_SOCIAL`（分层先验用） |
+
+**NewsEvent**（结构化市场事件，`id` 唯一，不可变；状态迁移通过新事件版本表达）
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| id | str | 是 | 事件 ID，如 `event_001` |
+| schema_version | int | 是 | schema 版本，默认 1 |
+| type | enum | 是 | `EXCHANGE_STATUS / EXCHANGE_HACK / REGULATORY_RISK / LISTING_DELISTING / MAINTENANCE / MARKET_NEWS / MACRO_EVENT`（受控词表，可扩展） |
+| state | enum | 是 | `CANDIDATE / CONFIRMED / RETRACTED`（撤回是一等公民） |
+| assets | list[str] | 是 | 影响标的（内部符号），空列表表示全市场 |
+| direction | enum | 是 | `POSITIVE / NEGATIVE / NEUTRAL / UNKNOWN` |
+| impact.severity | int | 是 | 1~10 |
+| impact.duration_hours | int | 是 | 影响窗口（事件过期机制） |
+| confidence | Decimal | 是 | 合成置信度 0~1（分层先验 + 多源一致性 + LLM 抽取，非 LLM 直报） |
+| published_at | datetime | 是 | 源发布时间（UTC） |
+| detected_at | datetime | 是 | 系统检测时间（UTC，评估管线延迟） |
+| source_refs | list[NewsSourceRef] | 是 | 至少一个来源；多源一致性参与置信度合成 |
+| raw | str | 是 | 原文/标题摘要（审计与抽取质量评估） |
+
+**CoordinatorIntent**（战略层投资意图，来源固定为 `coordinator`；走交易链路但不直接下单）
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| intent_id | str | 是 | 唯一 ID |
+| source | enum | 是 | 固定 `COORDINATOR` |
+| market_regime | dict | 是 | `{trend, volatility, volume}`（趋势/波动/成交量状态标记） |
+| portfolio_action.target_exposure | Decimal | 是 | 目标总敞口（权益比例 0~1） |
+| portfolio_action.reduce_risk | bool | 是 | 是否防御性减险（true 时优先级高于普通策略意图） |
+| portfolio_action.target_leverage | Decimal | 否 | 目标杠杆上限（如提供） |
+| portfolio_action.valid_until | datetime | 是 | 姿态有效期（必填，过期失效需重估） |
+| strategy_preference | list[dict] | 否 | `[{strategy_id, action(ENABLE/DISABLE/KEEP/REDUCE_WEIGHT), weight?}]`（软生效，见架构 §2.7.7） |
+| reason_refs | list[str] | 是 | 触发事件/状态工件 ID（审计） |
+| raw | dict | 否 | Coordinator 原始输出 |
 
 ## 4. 存储 Schema
 
 ### 4.1 SQLite 元数据库（`data/meta.db`）
 
-表清单：`instruments, symbol_mappings, exchange_meta, strategies, strategy_versions, strategy_params, strategy_allocations, portfolio_risk_snapshots, deployments, experiments, report_cards, metrics, risk_rules, risk_events, audit_log, tasks, artifacts`
+表清单：`instruments, symbol_mappings, exchange_meta, strategies, strategy_versions, strategy_params, strategy_allocations, portfolio_risk_snapshots, deployments, experiments, report_cards, metrics, risk_rules, risk_events, risk_mode_snapshots, news_events, audit_log, tasks, artifacts`
 
 参考 DDL（节选核心表，其余同风格）：
 
@@ -462,6 +513,7 @@ Raw 层（`data/raw/<source>/<exchange>/<instrument>/<data_type>/<YYYY-MM-DD>/`�
 ```
 data/raw/binance/btcusdt-perp/klines/2026-08-01/part-000.parquet
 data/raw/binance/btcusdt-perp/funding/2026-08-01/part-000.parquet
+data/raw/news/binance-announcement/2026-08-01/part-000.parquet   # 原始新闻（含原文/来源/时间）
 ```
 
 Normalized 层（`data/normalized/<interval>/<instrument>/`）：

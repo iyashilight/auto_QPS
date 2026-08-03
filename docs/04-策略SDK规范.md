@@ -130,6 +130,7 @@ class TrendBreakout(BaseStrategy):
 | 参数 | `ctx.params -> dict` | 当前部署的参数快照（不可变） |
 | 行情 | `ctx.latest_bar(instrument_id) -> Bar | None` | 最新已处理 K 线 |
 | 特征 | `ctx.feature(instrument_id, name) -> float | None` | 读取 Feature Pipeline 最新值 |
+| 市场状态 | `ctx.regime -> MarketRegimeView` | 当前市场状态与风险模式（只读软信号）：`{trend, volatility, volume, risk_mode}`；Coordinator 的 `strategy_preference` 通过该信号落地，策略自行决定是否响应 |
 | 历史 | `ctx.history(instrument_id, n) -> list[Bar]` | 最近 n 根 K 线（由框架提供，非策略自存） |
 | 持仓视图 | `ctx.positions -> list[PositionView]` | 当前部署相关持仓（只读） |
 | 资金视图 | `ctx.cash -> Decimal` | 可用资金（只读） |
@@ -141,7 +142,8 @@ class TrendBreakout(BaseStrategy):
 
 - `emit_intent` 内部：补全 `intent_id / strategy_id / deployment_id / valid_until`（若策略未填），执行字段白名单校验，随后发事件 `INTENT_CREATED`；
 - `ctx.state` 序列化为 JSON 持久化（内存态 + 落库），重启后恢复；
-- `ctx.history` 必须与 `on_bar` 收到的 bar 同源（同一 data_version/feature_version）。
+- `ctx.history` 必须与 `on_bar` 收到的 bar 同源（同一 data_version/feature_version）；
+- `ctx.regime` 由 Market Agent/规则内核周期更新并注入（每根 bar 前刷新）；策略读取它做软响应（如高波动下自动降频），**不强制**；强制约束（禁用新仓、降杠杆）由风控/组合层执行，策略无权绕过。
 
 ## 5. TradingIntent 输出规范
 

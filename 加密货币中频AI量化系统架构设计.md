@@ -1,6 +1,6 @@
 # 个人加密货币中频 AI 量化交易系统架构设计
 
-> 版本：v0.3（已按需求确认项更新：多策略组合模式、Binance 先行、免费数据、分层回测频率、CLI 优先、本机部署）
+> 版本：v0.4（新增：事件驱动多 Agent 架构、规则版新闻风控提前至 M5/M6、Coordinator 战略层边界、风险模式状态机；并同步 MVP 里程碑编号）
 > 定位：个人单机使用的量化研究与自动交易平台，非 SaaS、非多用户
 > 市场：加密货币（现货 Spot + 永续合约 Perpetual Futures），MVP 优先支持主流交易所
 > 频率：中频；默认研究频率 5m / 15m / 1h（1m 仅用于候选策略精细验证），不考虑毫秒级高频，但架构不排斥未来扩展
@@ -73,7 +73,8 @@
 - 交易系统负责**运行已验证策略**（在线、低延迟、强风控）；
 - 两者通过「不可变策略版本包」与「发布门禁」交互，各自独立演化；
 - 实盘运行结果回流到研究系统，形成「研究 → 验证 → 运行 → 反馈 → 再研究」的迭代闭环；
-- 当前阶段不接 LLM，但所有未来 AI Agent 需要的工件与端口现在就定义好。
+- 当前阶段不接 LLM，但所有未来 AI Agent 需要的工件与端口现在就定义好；
+- 系统形态为**事件驱动的多 Agent 量化系统**：News Agent（外部信息）与 Market Agent（行情状态）通过结构化事件驱动 Coordinator（战略决策），Quant Engine（策略/组合/风控/执行）负责验证与执行；Agent 按事件触发，不永久在线。
 
 ### 1.2 架构总览（文字图）
 
@@ -81,6 +82,7 @@
 ┌─────────────────────────────── 控制平面 ────────────────────────────────┐
 │  CLI / Web 控制台 │ Scheduler 调度器 │ Lifecycle Manager 生命周期管理器  │
 │  配置管理 │ 任务管理 │ 人工干预入口 │ Kill Switch（全局/策略级）          │
+│  Agent 网关（News / Market / Coordinator，事件驱动，M7 起）            │
 └──────────────┬───────────────────────────────────────────────┬──────────┘
                │ 发布/门禁/指令                                  │ 运行指令
 ┌──────────────▼────────────────┐              ┌───────────────▼──────────┐
@@ -117,6 +119,8 @@
 
 横向公共设施：事件总线 │ 配置中心 │ 结构化日志 │ 指标/告警 │ 审计日志
 ```
+
+事件总线提供**高优先级事件通道**：新闻事件（News Event）与风险模式变更（Risk Mode Change）以最高优先级同步投递到风控引擎，不受普通异步队列拥塞影响（详见 2.7 与 8.5 节）。
 
 ### 1.3 三层 Adapter 的职责划分（关键设计）
 
@@ -391,9 +395,157 @@ Strategy C ──意图──┘           │
 ### 2.6 公共设施（Cross-cutting）
 
 - 事件总线：进程内事件总线，支持同步直连（低延迟路径）与异步队列（解耦路径）；事件带 event_id 幂等、schema 版本；实盘事件异步落盘供重放；
+- **高优先级事件通道**：新闻事件、风险模式变更等防御性事件走同步直连通道，可打断普通处理流程（优先级高于行情/信号类事件）；
 - 结构化日志：JSON lines，统一字段（时间、模块、策略版本、订单/信号 ID），敏感字段脱敏；
 - 指标：回测耗时、信号→订单延迟、风控拦截次数、拒单率、持仓偏离度；
 - 审计日志：所有状态迁移、风控触发、人工干预、规则变更、Agent 任务。
+
+### 2.7 事件驱动多 Agent 架构（News / Market / Coordinator）
+
+> 本节定义系统未来接入 LLM 后的整体形态。当前阶段（M0~M6）不接 LLM，但架构、事件 schema、端口与规则版实现现在就落地，保证 M7 只是「替换实现」而非「重新设计」。
+
+#### 2.7.1 设计原则
+
+1. **规则优先，LLM 增强**：确定性风险（交易所状态、费率变化）由规则处理；LLM 只负责非结构化信息理解（新闻语义、市场解释）。规则负责执行，LLM 负责理解，两者不互相替代；
+2. **事件驱动激活**：Agent 不永久在线对话；每次运行 = 明确输入工件 + 明确输出工件，由调度器（定时）或事件（重大事件触发）确定性唤醒；
+3. **结构化输出**：所有 Agent 输出必须是固定 schema 的工件（结构化事件/意图），禁止输出自然语言给下游；
+4. **分层权限**：News Agent 拥有**响应优先级**（高优先级事件通道、可打断普通流程、可触发风险模式切换），但**没有交易权**（不能下单、不能改风控参数、不能绕过策略系统）；Coordinator 拥有**战略层意图权**（目标敞口/风险姿态/策略偏好），但**不直接下订单**，资金动作由 Portfolio Manager 计算、Risk Engine 裁决；
+5. **可审计**：每个 Agent 决策必须附带理由引用（来源事件/状态工件），输入输出全部留痕。
+
+#### 2.7.2 三个 Agent 的角色定义
+
+| Agent | 输入 | 输出 | 权限边界 |
+| --- | --- | --- | --- |
+| News Agent（新闻情报） | 分层新闻源（官方公告 / RSS / 未来社媒） | `NewsEvent`（结构化市场事件） | 高优先级事件通道；可触发风险模式切换；**无交易权、无参数修改权** |
+| Market Agent（市场状态） | 行情/特征/衍生品数据 | `MarketStateReport`（趋势/波动/流动性/交易环境） | 只读数据；输出市场状态工件 |
+| Coordinator Agent（战略决策，类基金经理） | NewsEvent + MarketStateReport + 当前持仓/风险状态 + 策略运行结果 | `PortfolioIntent`（目标风险姿态/目标敞口/策略偏好） | 战略层意图；**不能直接下订单**，不能跳过 Portfolio Manager 与 Risk Engine |
+
+三者协作关系：
+
+```
+News Agent ──NewsEvent──┐
+                        ├──► Coordinator Agent ──PortfolioIntent──► Portfolio Manager
+Market Agent ──MarketState──┘            （战略层）                      （资产层：仓位计划）
+                                                                    │
+                                                                    ▼
+                                                              Risk Engine（最终裁决）
+                                                                    │
+                                                                    ▼
+                                                              Execution Engine（订单层）
+```
+
+#### 2.7.3 新闻管线（News Pipeline）
+
+```
+新闻源（分层）
+    Binance/OKX 官方公告 │ RSS（CoinDesk/Cointelegraph/The Block） │ 社媒（后期）
+        │
+        ▼
+News Collector（轮询/监听，官方源 30~60s 一档，RSS 60~120s）
+        │
+        ▼
+Raw News Storage（原始新闻落盘，不可变，含来源/时间/原文）
+        │
+        ▼
+News Processing（规则抽取：类型分类、资产映射、关键词命中）
+        │
+        ▼
+News Agent（LLM 版：理解非结构化文本，输出结构化事件；规则版为占位实现）
+        │
+        ▼
+NewsEvent（固定 schema，见 2.7.4）
+        │
+        ▼
+事件总线（高优先级通道）→ Risk Mode Controller / Coordinator
+```
+
+数据源分层策略：
+
+| 层 | 来源 | 特点 | 用途 | 接入阶段 |
+| --- | --- | --- | --- | --- |
+| L1 官方源 | Binance 公告/状态页、OKX 公告 | 慢但可靠 | 交易所风险、规则变化、上下架、维护 | M5/M6（规则版） |
+| L2 新闻聚合 | CoinDesk、Cointelegraph、The Block（RSS/API） | 较快，需 source+timestamp+url | 市场情绪、宏观事件 | M6（规则版）/ M7（LLM 版） |
+| L3 社交媒体 | X/Twitter、Telegram、Reddit | 最快但噪声最大 | 舆情（须多源交叉验证） | M7 后期 |
+
+#### 2.7.4 NewsEvent 结构化事件（固定 schema）
+
+```json
+{
+  "id": "event_001",
+  "schema_version": 1,
+  "type": "exchange_hack",
+  "state": "candidate",
+  "assets": ["BTC", "ETH"],
+  "direction": "negative",
+  "impact": {"severity": 8, "duration_hours": 24},
+  "confidence": 0.85,
+  "published_at": "2026-08-03T10:00:00Z",
+  "detected_at": "2026-08-03T10:00:31Z",
+  "source_refs": [
+    {"name": "Binance Announcement", "url": "https://...", "time": "2026-08-03T10:00:00Z"}
+  ],
+  "raw": "原文标题/摘要"
+}
+```
+
+关键语义：
+
+- `state`：`candidate → confirmed → retracted`；**撤回是一等公民**——事件被证伪后必须能回滚风险模式；
+- `type` 使用受控词表（`exchange_status / exchange_hack / regulatory_risk / listing_delisting / maintenance / market_news / macro_event` 等），禁止自由文本；
+- `impact.severity` 1~10，`duration_hours` 为影响窗口（事件过期机制）；
+- `confidence` 为**合成置信度**：分层先验（官方源 0.9 起、RSS 0.6 起、社媒 0.3 起）+ 多源一致性加成 + LLM 抽取置信度，不是 LLM 直接报数；
+- `published_at`（源发布时间）与 `detected_at`（系统检测时间）分离，用于评估管线延迟；
+- `source_refs` 为数组（多源交叉验证），`raw` 保留原文供审计与抽取质量评估。
+
+#### 2.7.5 风险模式切换（确定性入口 + 滞回出口）
+
+- 事件 → 风险模式映射用**静态规则表**（配置）：`event_type + severity + confidence` → `NORMAL / CAUTION / DEFENSIVE / HALT` 及对应动作（禁止新仓、降杠杆等）；LLM 只产出事件，不写参数；
+- 状态机带**滞回**（防抖）：事件撤回后不立即回 NORMAL，需满足「撤回 + 波动率回落 + 观察窗口」后逐级恢复；`HALT` 只允许人工恢复；
+- 风险模式状态落库并广播 `RISK_MODE_CHANGED` 事件；详细状态机见 8.5 节。
+
+#### 2.7.6 Agent 激活模型（非永久在线）
+
+| 触发方式 | 适用 Agent | 说明 |
+| --- | --- | --- |
+| 定时调度 | Market Agent | 每 5m 或每根 bar 计算市场状态（规则内核，未来 LLM 增强） |
+| 事件触发 | News Agent | 新新闻到达即处理（官方源轮询/订阅推送） |
+| 事件触发（阈值规则判定） | Coordinator | NewsEvent severity ≥ 阈值、市场 regime 变化、组合风控状态变化——**由规则判定"是否重大"，不让 LLM 自唤醒** |
+
+#### 2.7.7 Coordinator 输出（PortfolioIntent）与边界
+
+Coordinator 输出「战略层投资意图」，走同一条交易链路，不绕过任何关卡：
+
+```json
+{
+  "intent_id": "coord_001",
+  "source": "coordinator",
+  "market_regime": {"trend": "bearish", "volatility": "high", "volume": "abnormal"},
+  "portfolio_action": {
+    "target_exposure": 0.3,
+    "reduce_risk": true,
+    "valid_until": "2026-08-04T10:00:00Z"
+  },
+  "strategy_preference": [
+    {"strategy_id": "trend_breakout", "action": "KEEP"},
+    {"strategy_id": "mean_reversion", "action": "DISABLE"}
+  ],
+  "reason_refs": ["event_001", "market_state_20260803T1000"]
+}
+```
+
+边界规则：
+
+- **层间职责**：Coordinator 定"姿态"（目标敞口、风险等级、策略偏好）；Portfolio Manager 定"动作"（当前持仓 → 目标权重的仓位调整计划，校验风险预算/换手/资金分配）；Execution Engine 定"订单"（卖多少、什么价、市价/限价、是否拆单）；Risk Engine 做最终裁决；
+- **`strategy_preference` 走软生效**：通过 `ctx.regime`（策略上下文注入市场状态，软信号）与 Portfolio/Risk 层的额度收紧（硬约束）落地；Coordinator 不直接调用生命周期管理器禁用策略；
+- **优先级语义**：`reduce_risk=true` 的 PortfolioIntent 优先级高于普通策略意图（可打断/覆盖），但仍必须过账户级风控；冲突时由 Risk Engine 裁决；
+- **有效期**：`portfolio_action.valid_until` 必填，过期后姿态失效需重新评估，防止旧判断永久锁仓；
+- **理由留痕**：`reason_refs` 引用触发事件与状态工件，供审计。
+
+#### 2.7.8 与现有系统及路线图的映射
+
+- 现有五个 Agent（Market Analyst / Strategy / Backtest / Optimization / Risk）保留；新增 **News Agent** 与 **Coordinator**，共七个角色；
+- **规则版新闻风控提前到 M5/M6**（不依赖 LLM）：M4 实现风险模式状态机，M5 Paper 阶段提供新闻模拟器并验证「事件 → 模式 → 减仓」链路，M6 实盘准备接入官方公告/RSS 真实源；
+- M7 之后：LLM News Agent **替代/增强**规则抽取（理解非结构化文本），Coordinator / Market Agent 换 LLM 实现；入口出口不变，上游零改动。
 
 ---
 
@@ -830,6 +982,42 @@ RiskRule {
 
 规则变更 = 新版本；版本间可对比（未来 AI Risk Agent 分析「哪条规则拦了多少单、误伤了多少信号」时依赖此对比能力）。
 
+### 8.5 风险模式状态机（事件驱动）
+
+风险模式是账户级的运行姿态，由**确定性规则**驱动（新闻事件/行情异常/组合状态），LLM 不直接写参数：
+
+```
+                ┌────────────┐
+  事件阈值未达   │  NORMAL    │
+   ────────────►│  (常规)     │
+                └─────┬──────┘
+                      │ 事件 severity/confidence 达阈值
+                      ▼
+                ┌────────────┐
+                │  CAUTION   │── 事件升级/连续触发 ──► ┌──────────┐
+                │  (谨慎)    │                        │ DEFENSIVE│
+                └─────┬──────┘◄───────────────────────│ (防御)   │
+                      │                               └─────┬────┘
+                      │ 撤回+观察窗口+波动率回落（逐级恢复） │ 极端事件/组合风险
+                      ▼                                     ▼
+                ┌────────────┐                          ┌────────┐
+                │  NORMAL    │◄──── 恢复（需人工）────── │  HALT  │
+                └────────────┘                          │ (停机) │
+                                                        └────────┘
+```
+
+规则：
+
+| 项目 | 规则 |
+| --- | --- |
+| 进入 | 静态映射表：`event_type + severity + confidence` → 目标模式与动作（禁止新仓、降杠杆、强减仓等）；行情异常（延迟/跳变）与组合风控状态（接近亏损线）也可触发 |
+| 退出 | 事件撤回 + 波动率回落 + 观察窗口（如 2h）后逐级恢复（DEFENSIVE → CAUTION → NORMAL），防抖滞回，禁止立即回跳 |
+| HALT | 只允许人工恢复（与 Kill Switch 同语义）；进程重启后从持久化状态恢复，恢复前冻结交易 |
+| 记录 | 每次切换广播 `RISK_MODE_CHANGED` 事件、落 `RiskModeSnapshot`（mode/entered_at/triggered_by/reason）并写审计日志 |
+| 生效 | 模式对策略与订单生效：DEFENSIVE 下开仓类意图被风控 BLOCK、杠杆上限下调；CAUTION 下仅收紧新仓 |
+
+风险模式与四级规则的关系：模式是**账户级横切状态**，四级规则仍逐单检查；模式改变规则的生效阈值（如 DEFENSIVE 下单笔限额减半），不替换规则引擎。
+
 ---
 
 ## 9. Broker 抽象设计
@@ -892,25 +1080,40 @@ Paper Broker 与 Exchange Broker 实现**完全一致**的接口，上层系统�
 
 阶段推进遵循：Research System 闭环 → Backtest Engine → Strategy Framework → Paper Trading → Portfolio Management → Risk Engine → Live Trading（M0~M3 共同构成 Research System 闭环，与第 0.2 节一致）。
 
-明确不提前开发：Web 控制台、多交易所接入、云部署、付费数据系统、高频交易基础设施。
+明确不提前开发：Web 控制台、多交易所接入、云部署、付费数据系统、高频交易基础设施、LLM 接入（M7 前不接 LLM；规则版新闻风控除外，它不依赖 LLM）。
+
+里程碑编号与提示词一致（prompts/M*.md）：
+
+| 里程碑 | 主题 | 说明 |
+| --- | --- | --- |
+| M0 | 基础框架 | 模型/事件/配置/数据库/端口 |
+| M1 | 市场数据 | Binance 采集 → 规范化 → 特征 |
+| M2 | 策略框架 | 策略 SDK 与注册表 |
+| M3 | 回测系统 | 双引擎 + 成本模型 + 优化 + 实验 |
+| M4 | 组合与风控 | Portfolio Manager + Risk Engine + 风险模式状态机 |
+| M5 | 模拟交易 | Paper Broker + 生命周期 + 新闻模拟器 + 事件 → 风险链路 |
+| M6 | 实盘交易准备 | Binance 实盘 + 对账/监控/Kill Switch + **规则版新闻风控（官方公告/RSS 真实源）** |
+| M7 | AI Agent 增强 | LLM News/Market/Coordinator + 五个研究类 Agent 占位 → LLM 化 |
 
 | 阶段 | 范围 | 里程碑/验收 |
 | --- | --- | --- |
 | M0 骨架与领域基础（1~2 周） | Monorepo、配置中心、结构化日志、事件总线（事件 schema 定义）、核心领域模型落地、元数据库 Schema | 事件总线可收发示例事件；模型可落库读回 |
 | M1 数据管道（2~4 周） | Binance 公开 REST 历史 K 线 + WebSocket 实时行情（默认 5m/15m/1h，1m 按需）；Raw → Normalized；交易日历/维护窗口处理；数据质量报告；基础特征管线（价格/成交量/波动率/资金费率/OI） | 一条「采集 → 规范化 → 特征」链路可重复跑通且可复现 |
-| M2 研究内核（3~5 周） | 策略脚手架 + 策略版本打包；Feature Engine 正式化；向量化回测引擎 + 事件驱动回测引擎（成本模型：手续费/滑点/资金费率/杠杆/保证金/强平）；指标计算 + ReportCard；实验记录与重跑 | 示例策略完成「创建 → 回测 → 报告 → 记录」全流程；强平模拟可验证 |
-| M3 优化与实验管理（2~3 周） | Optimizer：网格/随机 → 贝叶斯；多进程并行；walk-forward；OptimizationRun 与对比视图 | 千级参数搜索跑完并输出带 OOS 指标候选集 |
-| M4 模拟交易（3~4 周） | 生命周期状态机 + 门禁；Paper Broker；风控引擎基础规则（四级规则 MVP 集）；策略运行时隔离；Signal Engine；Execution Engine（Paper）；Portfolio Manager 基础（资金分配/权重/仓位合并/敞口聚合）；**多策略并行运行** | 多个验证过的策略同时进入 Paper Trading 连续运行；风控可拦截越界意图；仓位合并与敞口聚合正确 |
-| M5 实盘执行（3~6 周） | 实盘 Broker Adapter（1 家，Binance 现货+永续）；执行引擎实盘化（幂等/重试/超时/撤单）；Portfolio Manager 实盘化（多策略合并下单）；对账；监控/告警/Kill Switch | 小资金、多策略组合（≥2 个策略）、低频率实盘运行一周无异常且对账一致 |
-| M6 AI 网关与加固（2~4 周） | Artifact Store；Agent 网关端口 + 五个 Agent 本地占位实现；策略脚手架「可机器生成」化；风控规则版本对比；性能压测 | 模拟「Agent 提议策略 → 自动回测 → 分析建议 → 人工确认」全流程（全程无 LLM） |
+| M2 策略框架（2~3 周） | 策略脚手架（create 模板：trend/mean_reversion/grid）；strategy.yaml 解析与 params_schema 校验；BaseStrategy + StrategyContext（含 ctx.regime）+ emit_intent；静态检查沙箱；Strategy Registry（save_version/哈希/幂等）；demo_mean_reversion 示例策略 | 三种模板可生成并入库；静态检查拦截 5 类违规；emit_intent 校验覆盖所有拒绝分支；demo 策略入库 + 冒烟通过 |
+| M3 回测系统（3~5 周） | 向量化回测引擎 + 事件驱动回测引擎（成本模型：手续费/滑点/资金费率/杠杆/保证金/强平）；Metrics + ReportCard（含成本分列/OOS）；实验存储与 rerun 确定性；Optimizer（网格/随机 → 贝叶斯）+ walk-forward + OOS（**不可关闭**）；research/experiment CLI | 回测确定性（rerun 逐位一致）；强平/资金费率用例；未来函数拦截；千级参数搜索 + 固定 seed 可复现；**3 标的 5m + demo 策略产出完整 ReportCard（研究闭环演示）** |
+| M4 组合与风控（3~4 周） | 生命周期状态机 + 统计门禁（自动判定）；Paper Broker；风控引擎基础规则（四级规则 MVP 集）+ **风险模式状态机（NORMAL/CAUTION/DEFENSIVE/HALT，滞回）**；策略运行时隔离；Signal Engine；Execution Engine（Paper）；Portfolio Manager 基础（资金分配/权重/仓位合并/敞口聚合）；**多策略并行运行** | 多个验证过的策略同时进入 Paper Trading 连续运行；风控可拦截越界意图；仓位合并与敞口聚合正确；风险模式切换与滞回恢复正确 |
+| M5 模拟交易（3~4 周） | 生命周期门禁与 Paper 全链路；**新闻模拟器（`qps news inject`）与「事件 → 风险模式 → 减仓」链路验证**；规则版新闻管线骨架（官方源采集 / Raw 存储 / 规则抽取 / NewsEvent）；监控与告警 | Paper 连续运行 24h 无异常；注入合成新闻事件可正确触发风险模式切换与组合减仓；撤回事件可回滚模式（滞回） |
+| M6 实盘交易准备（3~6 周） | 实盘 Broker Adapter（1 家，Binance 现货+永续）；执行引擎实盘化（幂等/重试/超时/撤单）；Portfolio Manager 实盘化（多策略合并下单）；对账；监控/告警/Kill Switch；**规则版新闻风控（官方公告轮询 30~60s + RSS，NewsEvent 真实源，事件 → 模式延迟 < 1min，撤回处理）** | 小资金、多策略组合（≥2 个策略）、低频率实盘运行一周无异常且对账一致；真实公告事件可触发风险模式且延迟达标 |
+| M7 AI Agent 增强（2~4 周） | Artifact Store；Agent 网关端口（含触发类型：定时/事件）；News / Market / Coordinator 三 Agent 与五个研究类 Agent 的本地占位实现 → 逐步 LLM 化（News 理解非结构化文本、Coordinator 战略意图、Market 市场解释）；策略脚手架「可机器生成」化；风控规则版本对比；性能压测 | 模拟「新闻事件 → Coordinator 综合 → PortfolioIntent → 组合调仓 → 风控裁决」全流程；Agent 产出均为不可变工件且无交易句柄 |
 
 ### MVP 总体验收标准
 
-1. 一个策略可从生成走到 Paper Trading，全流程可追溯、可重跑；
-2. 实盘路径有强制风控 + 人工 Kill Switch + 对账；
+1. 一个策略可从生成走到 Paper Trading（统计门禁自动判定，无人工审核节点），全流程可追溯、可重跑；
+2. 实盘路径有强制风控（四级规则 + 风险模式）+ 人工 Kill Switch + 对账；
 3. 未接 LLM 时，所有 AI 端口已有占位实现，接口定义不依赖任何 LLM 技术；
 4. 回测、Paper、实盘三方成本口径一致（手续费/滑点/资金费率/强平）。
 5. 多策略组合模式下，资金分配、仓位合并、敞口聚合与控制均工作正常。
+6. 规则版新闻风控可用合成与真实事件驱动风险模式切换，撤回与滞回行为正确。
 
 ---
 
@@ -969,6 +1172,9 @@ Paper Broker 与 Exchange Broker 实现**完全一致**的接口，上层系统�
 | AI 建议不可审计 | 来源与依据不可追溯 | Agent 任务即工件（输入/输出/版本全留痕）；AI 产出默认 Draft |
 | AI 生成代码质量参差 | 直接进回测浪费计算 | 先静态检查 + 冒烟回测（小样本）再进正式流程 |
 | 门禁自动化稀释 | 「人工确认」形同虚设 | 人工节点最小集固定（升级 Production 必须人工）；门禁证据链完整 |
+| 新闻幻觉/假新闻 | LLM 或规则误判事件，触发错误风险模式 | 分层置信度合成 + 多源交叉验证 + `state=retracted` 撤回机制；高风险动作（HALT）只人工恢复 |
+| 风险模式抖动 | 真假事件交替导致模式反复切换 | 滞回状态机（撤回 + 观察窗口 + 波动率回落）+ 逐级恢复，禁止立即回跳 |
+| Agent 永久在线 | 对话式多 Agent 常驻成本高、状态混乱 | 事件驱动激活 + 无共享对话状态 + 工件化输入输出 |
 
 ### 11.7 评审总结与改进建议
 
@@ -1016,15 +1222,19 @@ Paper Broker 与 Exchange Broker 实现**完全一致**的接口，上层系统�
 
 | 决策项 | 结论 | 对应章节 |
 | --- | --- | --- |
-| 交易所 | Binance 先行（Paper Broker → Binance Adapter → OKX / Bybit）；全部经 Adapter 接入，核心系统不依赖具体交易所 | 1.3 / 9 / M1 / M5 |
+| 交易所 | Binance 先行（Paper Broker → Binance Adapter → OKX / Bybit）；全部经 Adapter 接入，核心系统不依赖具体交易所 | 1.3 / 9 / M1 / M6 |
 | 历史数据 | 免费公开 API，不购买付费数据；Data Adapter 端口预留 | 2.2.1 / 4.6 |
 | 回测频率 | 默认 5m / 15m / 1h；1m 仅用于候选精测、滑点测试、成交模拟 | 7.1 |
-| 控制台 | MVP 只做 CLI（任务、回测、策略管理、实验结果、交易状态），Web 延期 | 2.1.1 / M6 |
+| 控制台 | MVP 只做 CLI（任务、回测、策略管理、实验结果、交易状态），Web 延期 | 2.1.1 / M7 |
 | 部署 | 个人本机量化工作站；预留迁移小型服务器的可能（目录与配置可移植） | 0.3 / 12.1 |
 | 运行模式 | 多策略组合，Portfolio Manager 为一等模块；暂不做组合优化算法 | 2.4.6 / 3.5 |
+| 新闻风控 | 规则版提前至 M5/M6（官方公告 + RSS，无 LLM）；LLM 版 M7 增强/替代 | 2.7 / 8.5 / M5 / M6 |
+| Coordinator 边界 | 战略层 + 组合层意图（目标敞口/风险姿态/策略偏好），不直接下订单；Portfolio Manager 负责资金动作 | 2.7.7 / 6 |
+| Agent 激活 | 事件驱动（定时 + 事件触发），不永久在线；唤醒用规则判定，LLM 不自我唤醒 | 2.7.6 |
+| 风险模式 | 账户级运行姿态 NORMAL/CAUTION/DEFENSIVE/HALT，确定性入口 + 滞回出口，HALT 只人工 | 8.5 |
 
 其余开放问题（不阻塞开发，可后续再定）：策略初始资金分配方式（等权 / 人工指定 / 按回测绩效）、CLI 命令集完整清单、回测引擎性能基准。
 
 ---
 
-*本文档为 v0.3 架构设计，需求确认项已固化（见第 0 章与 12.3 节）。面向代码开发的实现规格见 [docs/README.md](docs/README.md) 及 docs/01~07 各文档（工程规范、领域模型与数据 Schema、接口契约、策略 SDK、事件定义、配置与 CLI、实施指南与验收标准）。*
+*本文档为 v0.4 架构设计，需求确认项已固化（见第 0 章与 12.3 节）。面向代码开发的实现规格见 [docs/README.md](docs/README.md) 及 docs/01~07 各文档（工程规范、领域模型与数据 Schema、接口契约、策略 SDK、事件定义、配置与 CLI、实施指南与验收标准）。事件驱动多 Agent 与新闻风控的详细规格见 docs/02 §3、docs/03 §12、docs/05、docs/06 及 prompts/M4~M7。*
