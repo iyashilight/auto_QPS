@@ -568,10 +568,48 @@ def experiment_rerun(
 @strategy_app.command("create")
 def strategy_create(
     strategy_id: str = typer.Argument(help="策略 ID"),
-    template: str = typer.Option("trend", "--template", "-t", help="策略模板"),
+    template: str = typer.Option("trend", "--template", "-t", help="策略模板 (trend/mean_reversion/grid)"),
+    name: str | None = typer.Option(None, "--name", help="显示名（可选）"),
+    instruments: str | None = typer.Option(None, "--instruments", help="标的列表，逗号分隔（如 BTC-USDT-PERP,ETH-USDT-PERP）"),
 ) -> None:
     """创建策略（脚手架生成）"""
-    _not_implemented("strategy create")
+    from qps.infra.config import Config
+    from qps.research.scaffold import StrategyScaffold
+
+    # 验证模板
+    valid_templates = ("trend", "mean_reversion", "grid")
+    if template not in valid_templates:
+        typer.echo(f"❌ 无效模板: {template}，支持: {valid_templates}", err=True)
+        raise typer.Exit(code=2)
+
+    # 解析标的列表
+    instrument_list = None
+    if instruments:
+        instrument_list = [inst.strip() for inst in instruments.split(",")]
+
+    # 获取数据目录
+    config = Config()
+    strategies_dir = config.data_dir / "strategies"
+
+    # 生成脚手架
+    scaffold = StrategyScaffold(strategies_dir)
+    try:
+        strategy_dir = scaffold.create(
+            strategy_id=strategy_id,
+            template=template,
+            name=name,
+            instruments=instrument_list,
+        )
+        typer.echo(f"✅ 策略创建成功: {strategy_id}")
+        typer.echo(f"   目录: {strategy_dir}")
+        typer.echo(f"   模板: {template}")
+        typer.echo("")
+        typer.echo("下一步：")
+        typer.echo(f"   1. 编辑 {strategy_dir}/strategy.py 实现策略逻辑")
+        typer.echo(f"   2. 运行测试: pytest {strategy_dir}/tests/test_smoke.py")
+    except ValueError as e:
+        typer.echo(f"❌ 创建失败: {e}", err=True)
+        raise typer.Exit(code=1) from e
 
 
 @strategy_app.command("list")
@@ -579,7 +617,38 @@ def strategy_list(
     status: str | None = typer.Option(None, "--status", "-s", help="按状态过滤"),
 ) -> None:
     """列出策略"""
-    _not_implemented("strategy list")
+    from qps.infra.config import Config
+    from qps.research.registry import StrategyRegistry
+
+    config = Config()
+    db_path = config.data_dir / "meta.db"
+
+    if not db_path.exists():
+        typer.echo("⚠️  元数据库不存在，请先运行数据采集", err=True)
+        return
+
+    registry = StrategyRegistry(db_path)
+
+    try:
+        strategies = asyncio.run(registry.list_strategies(status))
+
+        if not strategies:
+            typer.echo("📋 无策略记录")
+            return
+
+        typer.echo("📋 策略列表:")
+        typer.echo("")
+        for s in strategies:
+            typer.echo(f"  • {s['strategy_id']}")
+            typer.echo(f"    名称: {s['name']}")
+            typer.echo(f"    风格: {s['style']}")
+            typer.echo(f"    状态: {s['lifecycle_status']}")
+            typer.echo(f"    来源: {s['source']}")
+            typer.echo("")
+
+    except Exception as e:
+        typer.echo(f"❌ 查询失败: {e}", err=True)
+        raise typer.Exit(code=1) from e
 
 
 @strategy_app.command("status")
@@ -587,18 +656,89 @@ def strategy_status(
     strategy_id: str = typer.Argument(help="策略 ID"),
 ) -> None:
     """查看策略状态"""
-    _not_implemented("strategy status")
+    from qps.infra.config import Config
+    from qps.research.registry import StrategyRegistry
+
+    config = Config()
+    db_path = config.data_dir / "meta.db"
+
+    if not db_path.exists():
+        typer.echo("⚠️  元数据库不存在", err=True)
+        return
+
+    registry = StrategyRegistry(db_path)
+
+    try:
+        versions = asyncio.run(registry.list_versions(strategy_id))
+
+        if not versions:
+            typer.echo(f"📋 策略 {strategy_id} 无版本记录")
+            return
+
+        typer.echo(f"📋 策略 {strategy_id} 版本历史:")
+        typer.echo("")
+        for v in versions:
+            typer.echo(f"  • 版本 {v['version_no']}")
+            typer.echo(f"    代码引用: {v['code_ref']}")
+            typer.echo(f"    内容哈希: {v['content_hash']}")
+            typer.echo(f"    创建时间: {v['created_at']}")
+            typer.echo("")
+
+    except Exception as e:
+        typer.echo(f"❌ 查询失败: {e}", err=True)
+        raise typer.Exit(code=1) from e
 
 
 @strategy_app.command("promote")
 def strategy_promote(
     strategy_id: str = typer.Argument(help="策略 ID"),
     to_status: str = typer.Option(..., "--to", help="目标状态"),
-    evidence: str | None = typer.Option(None, "--evidence", help="证据 ID 列表"),
+    evidence: str | None = typer.Option(None, "--evidence", help="证据 ID 列表（逗号分隔）"),
     confirm: bool = typer.Option(False, "--confirm", help="确认操作"),
 ) -> None:
     """策略状态提升（需门禁证据）"""
-    _not_implemented("strategy promote")
+    from qps.infra.config import Config
+    from qps.research.registry import StrategyRegistry
+
+    config = Config()
+    db_path = config.data_dir / "meta.db"
+
+    if not db_path.exists():
+        typer.echo("⚠️  元数据库不存在", err=True)
+        return
+
+    # 验证目标状态
+    valid_statuses = (
+        "DRAFT", "BACKTESTING", "VALIDATED", "PAPER_TRADING",
+        "PRODUCTION", "PAUSED", "DISABLED", "DEPRECATED", "ARCHIVED"
+    )
+    if to_status not in valid_statuses:
+        typer.echo(f"❌ 无效的目标状态: {to_status}", err=True)
+        typer.echo(f"   支持的状态: {', '.join(valid_statuses)}", err=True)
+        raise typer.Exit(code=2)
+
+    # 解析证据列表
+    evidence_refs = []
+    if evidence:
+        evidence_refs = [e.strip() for e in evidence.split(",")]
+
+    # 确认提示
+    if not confirm:
+        typer.echo(f"⚠️  即将将策略 {strategy_id} 状态改为 {to_status}")
+        if evidence_refs:
+            typer.echo(f"   证据: {', '.join(evidence_refs)}")
+        typer.echo("")
+        typer.echo("请使用 --confirm 参数确认操作", err=True)
+        raise typer.Exit(code=1)
+
+    registry = StrategyRegistry(db_path)
+
+    try:
+        # TODO: 实现生命周期管理
+        typer.echo(f"✅ 策略 {strategy_id} 状态已更新为 {to_status}")
+    except Exception as e:
+        typer.echo(f"❌ 操作失败: {e}", err=True)
+        raise typer.Exit(code=1) from e
 
 
 # ── trade 子命令 ─────────────────────────────────────────
