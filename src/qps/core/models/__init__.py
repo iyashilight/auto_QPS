@@ -1,8 +1,9 @@
 """领域模型（Pydantic v2，frozen=True 默认）
 
 按 docs/02 定义，按域分文件：
-- instrument.py: Instrument, SymbolMapping, ExchangeMeta
+- instrument.py: Instrument, SymbolMapping, ExchangeMeta, ExchangeCalendar, CalendarBreak
 - market.py: Bar, Tick, OrderBookSnapshot, FundingRate, OpenInterest, MarkPrice, FeatureSet
+- adapter.py: AdapterStatus
 - strategy.py: Strategy, StrategyVersion, StrategyParams, Deployment
 - intent.py: TradingIntent
 - order.py: Order, Trade
@@ -22,6 +23,7 @@ from qps.core.models.account import (
     Snapshot,
     StrategyAllocation,
 )
+from qps.core.models.adapter import AdapterStatus
 from qps.core.models.artifact import Artifact
 from qps.core.models.audit import AuditLog
 from qps.core.models.experiment import (
@@ -32,7 +34,13 @@ from qps.core.models.experiment import (
     OptimizationRun,
     ReportCard,
 )
-from qps.core.models.instrument import ExchangeMeta, Instrument, SymbolMapping
+from qps.core.models.instrument import (
+    CalendarBreak,
+    ExchangeCalendar,
+    ExchangeMeta,
+    Instrument,
+    SymbolMapping,
+)
 from qps.core.models.intent import TradingIntent
 from qps.core.models.market import (
     Bar,
@@ -52,6 +60,8 @@ from qps.core.models.task import TaskRun
 __all__ = [
     # account
     "Account",
+    # adapter
+    "AdapterStatus",
     # artifact
     "Artifact",
     # audit
@@ -61,8 +71,10 @@ __all__ = [
     "Balance",
     # market
     "Bar",
+    "CalendarBreak",
     "DataRange",
     "Deployment",
+    "ExchangeCalendar",
     "ExchangeMeta",
     "FeatureSet",
     "FundingRate",

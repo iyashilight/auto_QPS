@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -41,6 +41,7 @@ from qps.core.models.account import (
     Position,
     StrategyAllocation,
 )
+from qps.core.models.adapter import AdapterStatus
 from qps.core.models.artifact import Artifact
 from qps.core.models.audit import AuditLog
 from qps.core.models.experiment import (
@@ -50,7 +51,13 @@ from qps.core.models.experiment import (
     OptimizationRun,
     ReportCard,
 )
-from qps.core.models.instrument import ExchangeMeta, Instrument, SymbolMapping
+from qps.core.models.instrument import (
+    CalendarBreak,
+    ExchangeCalendar,
+    ExchangeMeta,
+    Instrument,
+    SymbolMapping,
+)
 from qps.core.models.intent import TradingIntent
 from qps.core.models.market import (
     Bar,
@@ -167,6 +174,161 @@ class TestExchangeMeta:
         meta = ExchangeMeta(exchange_id="binance")
         assert meta.exchange_id == "binance"
         assert meta.rate_limits == []
+
+
+class TestCalendarBreak:
+    def test_valid(self) -> None:
+        cb = CalendarBreak(
+            start=datetime(2026, 8, 2, 4, 0, 0, tzinfo=UTC),
+            end=datetime(2026, 8, 2, 4, 30, 0, tzinfo=UTC),
+            reason="maintenance",
+        )
+        assert cb.reason == "maintenance"
+
+    def test_default_reason(self) -> None:
+        cb = CalendarBreak(
+            start=datetime(2026, 8, 2, 4, 0, 0, tzinfo=UTC),
+            end=datetime(2026, 8, 2, 4, 30, 0, tzinfo=UTC),
+        )
+        assert cb.reason is None
+
+    def test_start_ge_end_rejected(self) -> None:
+        """start >= end 拒绝"""
+        with pytest.raises(ValidationError, match="start 必须早于 end"):
+            CalendarBreak(
+                start=datetime(2026, 8, 2, 5, 0, 0, tzinfo=UTC),
+                end=datetime(2026, 8, 2, 4, 0, 0, tzinfo=UTC),
+            )
+
+    def test_start_eq_end_rejected(self) -> None:
+        """start == end 拒绝"""
+        with pytest.raises(ValidationError, match="start 必须早于 end"):
+            CalendarBreak(
+                start=datetime(2026, 8, 2, 4, 0, 0, tzinfo=UTC),
+                end=datetime(2026, 8, 2, 4, 0, 0, tzinfo=UTC),
+            )
+
+    def test_timezone_required(self) -> None:
+        """时间不带时区拒绝"""
+        with pytest.raises(ValidationError, match="时区"):
+            CalendarBreak(
+                start=datetime(2026, 8, 2, 4, 0, 0),
+                end=datetime(2026, 8, 2, 4, 30, 0, tzinfo=UTC),
+            )
+
+    def test_frozen(self) -> None:
+        cb = CalendarBreak(
+            start=datetime(2026, 8, 2, 4, 0, 0, tzinfo=UTC),
+            end=datetime(2026, 8, 2, 4, 30, 0, tzinfo=UTC),
+        )
+        with pytest.raises(ValidationError):
+            cb.reason = "changed"  # type: ignore[misc]
+
+
+class TestExchangeCalendar:
+    def test_valid(self) -> None:
+        cal = ExchangeCalendar(
+            exchange="binance",
+            date=date(2026, 8, 2),
+            session_open=datetime(2026, 8, 2, 0, 0, 0, tzinfo=UTC),
+            session_close=datetime(2026, 8, 2, 23, 59, 59, tzinfo=UTC),
+        )
+        assert cal.exchange == "binance"
+        assert cal.breaks == []
+
+    def test_with_breaks(self) -> None:
+        cal = ExchangeCalendar(
+            exchange="binance",
+            date=date(2026, 8, 2),
+            session_open=datetime(2026, 8, 2, 0, 0, 0, tzinfo=UTC),
+            session_close=datetime(2026, 8, 2, 23, 59, 59, tzinfo=UTC),
+            breaks=[
+                CalendarBreak(
+                    start=datetime(2026, 8, 2, 4, 0, 0, tzinfo=UTC),
+                    end=datetime(2026, 8, 2, 4, 30, 0, tzinfo=UTC),
+                    reason="maintenance",
+                ),
+            ],
+        )
+        assert len(cal.breaks) == 1
+
+    def test_required_fields_missing(self) -> None:
+        """必填缺失拒绝"""
+        with pytest.raises(ValidationError):
+            ExchangeCalendar(exchange="binance")  # type: ignore[call-arg]
+
+    def test_session_open_ge_close_rejected(self) -> None:
+        """session_open >= session_close 拒绝"""
+        with pytest.raises(ValidationError, match="session_open 必须早于 session_close"):
+            ExchangeCalendar(
+                exchange="binance",
+                date=date(2026, 8, 2),
+                session_open=datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC),
+                session_close=datetime(2026, 8, 2, 8, 0, 0, tzinfo=UTC),
+            )
+
+    def test_timezone_required(self) -> None:
+        """时间不带时区拒绝"""
+        with pytest.raises(ValidationError, match="时区"):
+            ExchangeCalendar(
+                exchange="binance",
+                date=date(2026, 8, 2),
+                session_open=datetime(2026, 8, 2, 0, 0, 0),  # 无时区
+                session_close=datetime(2026, 8, 2, 23, 59, 59, tzinfo=UTC),
+            )
+
+    def test_frozen(self) -> None:
+        cal = ExchangeCalendar(
+            exchange="binance",
+            date=date(2026, 8, 2),
+            session_open=datetime(2026, 8, 2, 0, 0, 0, tzinfo=UTC),
+            session_close=datetime(2026, 8, 2, 23, 59, 59, tzinfo=UTC),
+        )
+        with pytest.raises(ValidationError):
+            cal.exchange = "okx"  # type: ignore[misc]
+
+
+class TestAdapterStatus:
+    def test_valid_connected(self) -> None:
+        status = AdapterStatus(
+            connected=True,
+            last_heartbeat=datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC),
+            reconnect_count=2,
+            latency_ms=50,
+        )
+        assert status.connected is True
+        assert status.reconnect_count == 2
+        assert status.latency_ms == 50
+
+    def test_defaults(self) -> None:
+        """默认值正确"""
+        status = AdapterStatus(connected=False)
+        assert status.last_heartbeat is None
+        assert status.reconnect_count == 0
+        assert status.latency_ms is None
+
+    def test_reconnect_count_negative_rejected(self) -> None:
+        """reconnect_count < 0 拒绝"""
+        with pytest.raises(ValidationError):
+            AdapterStatus(connected=True, reconnect_count=-1)
+
+    def test_latency_ms_negative_rejected(self) -> None:
+        """latency_ms < 0 拒绝"""
+        with pytest.raises(ValidationError):
+            AdapterStatus(connected=True, latency_ms=-1)
+
+    def test_last_heartbeat_timezone_required(self) -> None:
+        """last_heartbeat 不带时区拒绝"""
+        with pytest.raises(ValidationError, match="时区"):
+            AdapterStatus(
+                connected=True,
+                last_heartbeat=datetime(2026, 8, 2, 12, 0, 0),  # 无时区
+            )
+
+    def test_frozen(self) -> None:
+        status = AdapterStatus(connected=True)
+        with pytest.raises(ValidationError):
+            status.connected = False  # type: ignore[misc]
 
 
 # ── Bar ────────────────────────────────────────────────────
@@ -738,13 +900,16 @@ class TestModelImports:
     def test_all_models_importable(self) -> None:
         from qps.core.models import (  # noqa: F401
             Account,
+            AdapterStatus,
             Artifact,
             AuditLog,
             BacktestRun,
             Balance,
             Bar,
+            CalendarBreak,
             DataRange,
             Deployment,
+            ExchangeCalendar,
             ExchangeMeta,
             FeatureSet,
             FundingRate,

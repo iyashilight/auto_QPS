@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import datetime
 
+    from qps.core.models.adapter import AdapterStatus
+
 
 @runtime_checkable
 class ExchangeAdapterPort(Protocol):
@@ -77,9 +79,9 @@ class ExchangeAdapterPort(Protocol):
         """
         ...
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> AdapterStatus:
         """查询适配器连接状态
 
-        后置：返回 AdapterStatus {connected, last_heartbeat, reconnect_count, latency_ms}
+        后置：返回 AdapterStatus（见 docs/02 §3.2）
         """
         ...

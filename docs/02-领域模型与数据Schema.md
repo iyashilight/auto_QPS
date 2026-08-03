@@ -2,7 +2,7 @@
 
 > 适用：所有开发者。M0 阶段按本文件实现 `src/qps/core/models/` 与数据库表。
 > 约定：模型用 Pydantic v2 定义；字段名即数据库列名（snake_case）；时间为 UTC；资金/价格为 Decimal。
-> 最后更新：2026-08-02
+> 最后更新：2026-08-03
 
 ## 1. 模型总览
 
@@ -10,8 +10,9 @@
 
 ```
 models/
-├── instrument.py    # Instrument, SymbolMapping, ExchangeMeta
+├── instrument.py    # Instrument, SymbolMapping, ExchangeMeta, ExchangeCalendar, CalendarBreak
 ├── market.py        # Bar, Tick, OrderBookSnapshot, FundingRate, OpenInterest, MarkPrice, FeatureSet
+├── adapter.py       # AdapterStatus
 ├── strategy.py      # Strategy, StrategyVersion, StrategyParams, Deployment
 ├── intent.py        # TradingIntent
 ├── order.py         # Order, Trade
@@ -74,6 +75,24 @@ models/
 | ws_endpoints / rest_endpoints | dict | 端点 |
 | maintenance_schedule | list | 维护窗口（可人工维护） |
 
+**CalendarBreak**：维护/暂停窗口
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| start | datetime(UTC) | 是 | 窗口开始时间 |
+| end | datetime(UTC) | 是 | 窗口结束时间（必须 > start） |
+| reason | str \| None | 否 | 原因，如 `maintenance` |
+
+**ExchangeCalendar**：每日期一条记录
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| exchange | str | 是 | 交易所/市场 ID，如 `binance` |
+| date | date | 是 | 交易日（UTC 日期） |
+| session_open | datetime(UTC) | 是 | 开市时间（必须 < session_close） |
+| session_close | datetime(UTC) | 是 | 收市时间 |
+| breaks | list[CalendarBreak] | 否 | 维护/暂停窗口，默认空列表 |
+
 ### 3.2 市场数据
 
 **Bar**（主键：`instrument_id + open_time + interval`）
@@ -102,6 +121,15 @@ models/
 **MarkPrice**：`instrument_id + ts`；字段 `mark_price, index_price, exchange_ts`
 
 **FeatureSet**：`instrument_id + ts + feature_name`；字段 `value, feature_version, data_version`
+
+**AdapterStatus**：适配器连接状态快照
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| connected | bool | 是 | 是否已连接 |
+| last_heartbeat | datetime(UTC) \| None | 否 | 最近心跳时间，默认 None |
+| reconnect_count | int | 否 | 断线重连次数，默认 0，必须 >= 0 |
+| latency_ms | int \| None | 否 | 最近延迟（毫秒），默认 None，必须 >= 0 |
 
 ### 3.3 策略与版本
 

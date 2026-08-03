@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from qps.core.models.instrument import Instrument
+    from qps.core.models.instrument import ExchangeCalendar, Instrument
     from qps.core.models.market import (
         Bar,
         FeatureSet,
@@ -122,10 +122,10 @@ class DataProviderPort(Protocol):
         """
         ...
 
-    def calendar(self, exchange: str) -> list[dict[str, Any]]:
+    def calendar(self, exchange: str) -> list[ExchangeCalendar]:
         """查询交易所日历
 
         前置：exchange 存在
-        后置：返回交易日历列表（维护窗口、结算时间等）
+        后置：返回交易日历列表，按日期升序
         """
         ...

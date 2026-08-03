@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from qps.core.models.account import Account, Position
+    from qps.core.models.adapter import AdapterStatus
     from qps.core.models.order import Order
 
 
@@ -81,9 +82,9 @@ class BrokerAdapterPort(Protocol):
         """注册账户更新回调"""
         ...
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> AdapterStatus:
         """查询适配器连接状态
 
-        后置：返回 AdapterStatus {connected, last_heartbeat, reconnect_count, latency_ms}
+        后置：返回 AdapterStatus（见 docs/02 §3.2）
         """
         ...

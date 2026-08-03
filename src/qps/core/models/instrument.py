@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import date as date_type
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from qps.core.constants import AssetClass, InstrumentStatus, MarginMode
+from qps.core.models.validators import validate_utc_datetime
 
 
 class Instrument(BaseModel):
@@ -61,3 +64,47 @@ class ExchangeMeta(BaseModel):
     maintenance_schedule: list[dict[str, Any]] = Field(default_factory=list, description="维护窗口")
 
     model_config = {"frozen": True}
+
+
+class CalendarBreak(BaseModel):
+    """交易日维护/暂停窗口"""
+
+    start: datetime = Field(description="窗口开始时间（UTC）")
+    end: datetime = Field(description="窗口结束时间（UTC）")
+    reason: str | None = Field(default=None, description="原因，如 maintenance")
+
+    model_config = {"frozen": True}
+
+    @field_validator("start", "end")
+    @classmethod
+    def _validate_timezone(cls, v: datetime) -> datetime:
+        return validate_utc_datetime(v)
+
+    @model_validator(mode="after")
+    def _validate_start_before_end(self) -> CalendarBreak:
+        if self.start >= self.end:
+            raise ValueError("start 必须早于 end")
+        return self
+
+
+class ExchangeCalendar(BaseModel):
+    """交易所日历（每日期一条记录）"""
+
+    exchange: str = Field(description="交易所/市场 ID，如 binance")
+    date: date_type = Field(description="交易日（UTC 日期）")
+    session_open: datetime = Field(description="开市时间（UTC）")
+    session_close: datetime = Field(description="收市时间（UTC）")
+    breaks: list[CalendarBreak] = Field(default_factory=list, description="维护/暂停窗口")
+
+    model_config = {"frozen": True}
+
+    @field_validator("session_open", "session_close")
+    @classmethod
+    def _validate_timezone(cls, v: datetime) -> datetime:
+        return validate_utc_datetime(v)
+
+    @model_validator(mode="after")
+    def _validate_session_order(self) -> ExchangeCalendar:
+        if self.session_open >= self.session_close:
+            raise ValueError("session_open 必须早于 session_close")
+        return self

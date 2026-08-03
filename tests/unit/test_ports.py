@@ -236,3 +236,40 @@ class TestServicesPortsSignature:
 
     def test_agent_gateway_has_write_artifact(self) -> None:
         assert hasattr(AgentGatewayPort, "write_artifact")
+
+
+# ── 强类型返回签名校验 ──────────────────────────────────────────
+
+
+class TestStrongTypedReturns:
+    """验证 4 个端口方法返回强类型（非 dict[str, Any]）"""
+
+    def _get_return_annotation_name(self, port_class: type, method_name: str) -> str:
+        """获取端口方法返回类型的字符串表示"""
+        method = getattr(port_class, method_name)
+        sig = inspect.signature(method)
+        return str(sig.return_annotation)
+
+    def test_data_provider_calendar_returns_exchange_calendar_list(self) -> None:
+        """DataProviderPort.calendar() -> list[ExchangeCalendar]"""
+        ann = self._get_return_annotation_name(DataProviderPort, "calendar")
+        assert "ExchangeCalendar" in ann, f"calendar() 返回类型应为 list[ExchangeCalendar]，实际为 {ann}"
+        assert "dict" not in ann.lower(), f"calendar() 不应返回 dict，实际为 {ann}"
+
+    def test_market_adapter_status_returns_adapter_status(self) -> None:
+        """MarketAdapterPort.status() -> AdapterStatus"""
+        ann = self._get_return_annotation_name(MarketAdapterPort, "status")
+        assert "AdapterStatus" in ann, f"status() 返回类型应为 AdapterStatus，实际为 {ann}"
+        assert "dict" not in ann.lower(), f"status() 不应返回 dict，实际为 {ann}"
+
+    def test_exchange_adapter_status_returns_adapter_status(self) -> None:
+        """ExchangeAdapterPort.status() -> AdapterStatus"""
+        ann = self._get_return_annotation_name(ExchangeAdapterPort, "status")
+        assert "AdapterStatus" in ann, f"status() 返回类型应为 AdapterStatus，实际为 {ann}"
+        assert "dict" not in ann.lower(), f"status() 不应返回 dict，实际为 {ann}"
+
+    def test_broker_adapter_status_returns_adapter_status(self) -> None:
+        """BrokerAdapterPort.status() -> AdapterStatus"""
+        ann = self._get_return_annotation_name(BrokerAdapterPort, "status")
+        assert "AdapterStatus" in ann, f"status() 返回类型应为 AdapterStatus，实际为 {ann}"
+        assert "dict" not in ann.lower(), f"status() 不应返回 dict，实际为 {ann}"
