@@ -1,12 +1,20 @@
 """CLI 命令入口（见 06 文档第 4 节）
 
 命令树：qps → data/research/experiment/strategy/trade/risk/task/broker
-本阶段所有子命令返回「未实现」提示。
+M1 阶段实现 data 子命令（collect/verify/status）。
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
+
 import typer
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 app = typer.Typer(
     name="qps",
@@ -41,6 +49,24 @@ def _not_implemented(name: str) -> None:
     raise typer.Exit(code=1)
 
 
+def _get_data_dir() -> Path:
+    """获取数据目录"""
+    from qps.infra.config import Config
+
+    config = Config()
+    return config.data_dir
+
+
+def _make_instrument_id(instrument: str) -> str:
+    """将用户输入的标的符号转为内部 ID
+
+    BTC-USDT-PERP → binance-btc-usdt-perp
+    """
+    if "-" in instrument and not instrument.startswith("binance-"):
+        return f"binance-{instrument.lower()}"
+    return instrument.lower()
+
+
 # ── data 子命令 ──────────────────────────────────────────
 
 
@@ -48,26 +74,200 @@ def _not_implemented(name: str) -> None:
 def data_collect(
     instrument: str = typer.Argument(help="标的符号，如 BTC-USDT-PERP"),
     interval: str = typer.Option("5m", "--interval", "-i", help="K 线间隔"),
-    start: str | None = typer.Option(None, "--start", help="开始日期"),
-    end: str | None = typer.Option(None, "--end", help="结束日期"),
+    start: str | None = typer.Option(None, "--start", help="开始日期 (YYYY-MM-DD)"),
+    end: str | None = typer.Option(None, "--end", help="结束日期 (YYYY-MM-DD)"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
-    """历史数据采集"""
-    _not_implemented("data collect")
+    """历史数据采集（异步任务，进度可查）"""
+    from qps.broker.exchange_adapter.binance_exchange_adapter import BinanceExchangeAdapter
+    from qps.data.adapters.binance_market_adapter import BinanceMarketAdapter
+    from qps.data.pipeline.normalizer import Normalizer, RawWriter
+
+    # 解析日期
+    if start is None:
+        typer.echo("❌ 必须指定 --start 日期", err=True)
+        raise typer.Exit(code=2)
+    if end is None:
+        typer.echo("❌ 必须指定 --end 日期", err=True)
+        raise typer.Exit(code=2)
+
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=UTC)
+        end_dt = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError as e:
+        typer.echo(f"❌ 日期格式错误: {e}", err=True)
+        raise typer.Exit(code=2) from e
+
+    instrument_id = _make_instrument_id(instrument)
+
+    # 验证 K 线间隔
+    valid_intervals = ("1m", "5m", "15m", "1h")
+    if interval not in valid_intervals:
+        typer.echo(f"❌ 不支持的 K 线间隔: {interval}，支持: {valid_intervals}", err=True)
+        raise typer.Exit(code=2)
+
+    async def _collect() -> None:
+        # 创建适配器
+        exchange_adapter = BinanceExchangeAdapter()
+        market_adapter = BinanceMarketAdapter(exchange_adapter=exchange_adapter)
+
+        try:
+            await market_adapter.connect()
+
+            # 采集历史 K 线
+            typer.echo(f"📊 采集 {instrument} {interval} K 线 [{start}, {end})...")
+            bars = await market_adapter.fetch_historical_bars(
+                instrument_id, interval, start_dt, end_dt
+            )
+
+            if not bars:
+                typer.echo("⚠️  未采集到数据", err=True)
+                return
+
+            # Raw 落盘
+            data_dir = _get_data_dir()
+            raw_writer = RawWriter(raw_dir=data_dir / "raw", source="binance")
+            symbol = instrument.lower().replace("-", "")
+            raw_files = raw_writer.write_bars(symbol, bars)
+
+            # Normalized
+            normalizer = Normalizer(normalized_dir=data_dir / "normalized")
+            normalized, report = normalizer.normalize_bars(bars, instrument_id, interval)
+            norm_path = normalizer.write_normalized_bars(normalized, instrument_id, interval)
+
+            # 输出结果
+            if json_output:
+                result = {
+                    "instrument": instrument,
+                    "instrument_id": instrument_id,
+                    "interval": interval,
+                    "start": start,
+                    "end": end,
+                    "bars_collected": len(bars),
+                    "bars_normalized": len(normalized),
+                    "quality": report.overall_quality.value,
+                    "quality_report": report.to_dict(),
+                    "raw_files": [str(f) for f in raw_files],
+                    "normalized_file": str(norm_path) if norm_path else None,
+                }
+                typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                typer.echo(f"✅ 采集完成: {len(bars)} 根 K 线")
+                typer.echo(f"   Raw 文件: {len(raw_files)} 个")
+                typer.echo(f"   Normalized: {norm_path}")
+                typer.echo(f"   数据质量: {report.overall_quality.value}")
+                if report.gaps:
+                    typer.echo(f"   缺口: {len(report.gaps)} 个")
+                if report.suspect_bars > 0:
+                    typer.echo(f"   可疑数据: {report.suspect_bars} 根")
+
+        except Exception as e:
+            typer.echo(f"❌ 采集失败: {e}", err=True)
+            raise typer.Exit(code=1) from e
+        finally:
+            await market_adapter.disconnect()
+
+    asyncio.run(_collect())
 
 
 @data_app.command("verify")
 def data_verify(
     instrument: str = typer.Argument(help="标的符号"),
-    interval: str | None = typer.Option(None, "--interval", "-i", help="K 线间隔"),
+    interval: str = typer.Option("5m", "--interval", "-i", help="K 线间隔"),
+    start: str | None = typer.Option(None, "--start", help="开始日期"),
+    end: str | None = typer.Option(None, "--end", help="结束日期"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """数据质量检查"""
-    _not_implemented("data verify")
+    from qps.data.pipeline.normalizer import QualityChecker
+
+    instrument_id = _make_instrument_id(instrument)
+    data_dir = _get_data_dir()
+
+    start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=UTC) if start else datetime(2020, 1, 1, tzinfo=UTC)
+    end_dt = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=UTC) if end else datetime.now(tz=UTC)
+
+    checker = QualityChecker(normalized_dir=data_dir / "normalized")
+    report = checker.check_bars(instrument_id, interval, start_dt, end_dt)
+
+    if json_output:
+        typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        typer.echo(f"📊 数据质量报告: {instrument} ({interval})")
+        typer.echo(f"   总 K 线数: {report.total_bars}")
+        typer.echo(f"   OK: {report.ok_bars}")
+        typer.echo(f"   SUSPECT: {report.suspect_bars}")
+        typer.echo(f"   缺口: {len(report.gaps)} 个")
+        typer.echo(f"   乱序: {report.out_of_order} 条")
+        typer.echo(f"   价格跳变: {len(report.price_jumps)} 处")
+        typer.echo(f"   整体质量: {report.overall_quality.value}")
 
 
 @data_app.command("status")
-def data_status() -> None:
+def data_status(
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
+) -> None:
     """数据覆盖状态"""
-    _not_implemented("data status")
+    data_dir = _get_data_dir()
+
+    # 扫描 Normalized 数据目录
+    normalized_dir = data_dir / "normalized"
+    coverage: list[dict[str, Any]] = []
+
+    if normalized_dir.exists():
+        for interval_dir in sorted(normalized_dir.iterdir()):
+            if not interval_dir.is_dir():
+                continue
+            interval = interval_dir.name
+            for symbol_dir in sorted(interval_dir.iterdir()):
+                if not symbol_dir.is_dir():
+                    continue
+                symbol = symbol_dir.name
+                parquet_files = list(symbol_dir.glob("*.parquet"))
+                years = sorted([f.stem for f in parquet_files])
+                if years:
+                    coverage.append({
+                        "instrument": symbol,
+                        "interval": interval,
+                        "years": years,
+                        "file_count": len(parquet_files),
+                    })
+
+    # 扫描 Raw 数据目录
+    raw_dir = data_dir / "raw"
+    raw_sources: list[str] = []
+    if raw_dir.exists():
+        raw_sources = sorted([d.name for d in raw_dir.iterdir() if d.is_dir()])
+
+    # 扫描特征数据目录
+    features_dir = data_dir / "features"
+    feature_versions: list[str] = []
+    if features_dir.exists():
+        feature_versions = sorted([d.name for d in features_dir.iterdir() if d.is_dir()])
+
+    if json_output:
+        result = {
+            "data_dir": str(data_dir),
+            "normalized_coverage": coverage,
+            "raw_sources": raw_sources,
+            "feature_versions": feature_versions,
+        }
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        typer.echo("📊 数据覆盖状态")
+        typer.echo(f"   数据目录: {data_dir}")
+        typer.echo(f"   Raw 数据源: {', '.join(raw_sources) if raw_sources else '无'}")
+        typer.echo(f"   特征版本: {', '.join(feature_versions) if feature_versions else '无'}")
+        if coverage:
+            typer.echo("   Normalized 数据:")
+            for item in coverage:
+                typer.echo(
+                    f"     {item['instrument']} ({item['interval']}): "
+                    f"{item['years'][0]}-{item['years'][-1]}, "
+                    f"{item['file_count']} 个文件"
+                )
+        else:
+            typer.echo("   Normalized 数据: 无")
 
 
 # ── research 子命令 ──────────────────────────────────────

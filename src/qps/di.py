@@ -2,8 +2,7 @@
 
 提供 build_container(config) 与 build_test_container()。
 所有模块通过构造器注入端口，禁止模块内部自行 new 实现。
-本阶段端口实现可为占位（抛 NotImplementedError 或返回未实现状态），
-但容器结构必须可扩展。
+M1 阶段注册：exchange_adapter, market_adapter, feature_pipeline。
 """
 
 from __future__ import annotations
@@ -128,13 +127,52 @@ def build_container(config: Config) -> Container:
     app_config = validate_config(config.raw_data)
     container = Container(config, app_config)
 
-    # 注册占位端口实现
+    # ── M1: Exchange Adapter & Market Adapter ─────────────
+    from qps.broker.exchange_adapter.binance_exchange_adapter import (
+        BinanceExchangeAdapter,
+    )
+    from qps.data.adapters.binance_market_adapter import BinanceMarketAdapter
+
+    # 从配置读取 Binance 适配器参数
+    exchange_config = app_config.exchange
+    binance_config = exchange_config.adapters.get("binance", {})
+    if isinstance(binance_config, dict):
+        base_url = binance_config.get("base_url", "https://api.binance.com")
+        ws_base_url = binance_config.get("ws_base_url", "wss://stream.binance.com:9443")
+        testnet = binance_config.get("testnet", False)
+        rate_limit = binance_config.get("rate_limit", {})
+        rest_per_sec = rate_limit.get("rest_per_sec", 10) if isinstance(rate_limit, dict) else 10
+    else:
+        base_url = getattr(binance_config, "base_url", "https://api.b2inance.com")
+        ws_base_url = getattr(binance_config, "ws_base_url", "wss://stream.binance.com:9443")
+        testnet = getattr(binance_config, "testnet", False)
+        rest_per_sec = 10
+
+    exchange_adapter = BinanceExchangeAdapter(
+        base_url=base_url,
+        ws_base_url=ws_base_url,
+        testnet=testnet,
+        rate_limit_per_sec=float(rest_per_sec),
+    )
+    container.register_port("exchange_adapter", exchange_adapter)
+
+    market_adapter = BinanceMarketAdapter(exchange_adapter=exchange_adapter)
+    container.register_port("market_adapter", market_adapter)
+
+    # ── M1: Feature Pipeline ──────────────────────────────
+    from qps.data.features.engine import FeatureEngine, register_mvp_features
+
+    feature_engine = FeatureEngine(
+        features_dir=config.data_dir / "features",
+        data_version="binance-default",
+    )
+    register_mvp_features(feature_engine)
+    container.register_port("feature_pipeline", feature_engine)
+
+    # ── 占位端口（后续里程碑实现）────────────────────────────
     _port_names = [
         "data_provider",
-        "market_adapter",
-        "exchange_adapter",
         "broker_adapter",
-        "feature_pipeline",
         "backtest_engine",
         "optimizer",
         "strategy_registry",

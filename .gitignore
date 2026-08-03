@@ -1,5 +1,5 @@
-# 运行数据目录（gitignore）
-data/
+# 运行数据目录（gitignore，仅根目录）
+/data/
 
 # Python
 __pycache__/
