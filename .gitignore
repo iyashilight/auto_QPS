@@ -1,0 +1,48 @@
+# 运行数据目录（gitignore）
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 环境变量
+.env
+.env.*
+
+# 日志
+*.log
+logs/
+
+# mypy
+.mypy_cache/
+
+# ruff
+.ruff_cache/
+
+# pytest
+.pytest_cache/
+
+# 覆盖率
+htmlcov/
+.coverage
+coverage.xml
+
+# OS
+.DS_Store
+Thumbs.db
+

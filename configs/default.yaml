@@ -1,0 +1,92 @@
+project:
+  name: autoQps
+  data_dir: ./data
+  timezone: UTC
+
+exchange:
+  primary: binance
+  adapters:
+    binance:
+      base_url: https://api.binance.com
+      ws_base_url: wss://stream.binance.com:9443
+      testnet: false
+      api_key: ${QPS_BINANCE_API_KEY}
+      api_secret: ${QPS_BINANCE_API_SECRET}
+      rate_limit:
+        rest_per_sec: 10
+        ws_per_sec: 5
+
+market_data:
+  default_interval: 5m
+  intervals: [1m, 5m, 15m, 1h]
+  collect_1m: false
+  subscriptions: [BTC-USDT-PERP, ETH-USDT-PERP]
+
+backtest:
+  default_mode: event_driven
+  default_interval: 5m
+  costs:
+    maker_fee: 0.0002
+    taker_fee: 0.0004
+    slippage_model: fixed
+    slippage_bps: 3
+    funding_rate_source: real
+    leverage: 3
+    margin_mode: ISOLATED
+    liquidation_margin_rate: 0.005
+  parallel_workers: 4
+  random_seed: 42
+
+optimizer:
+  algorithm: grid
+  budget: 1000
+  parallel_workers: 4
+  walkforward:
+    train_len: 60
+    val_len: 20
+
+risk:
+  account:
+    max_total_notional: 10000
+    max_daily_loss: 500
+    max_total_drawdown: 0.15
+    max_combined_leverage: 3
+  strategy_defaults:
+    max_position_notional: 2000
+    max_daily_loss: 200
+    signal_freq_per_min: 10
+    cooldown_minutes: 30
+  order:
+    max_single_notional: 2000
+    max_price_deviation_pct: 0.02
+  market:
+    max_latency_ms: 500
+    freeze_on_ws_disconnect: true
+
+portfolio:
+  mode: multi_strategy
+  allocation_currency: USDT
+  strategy_weights:
+    trend_breakout: 0.5
+    grid_btc: 0.5
+
+paper:
+  fill_latency_ms: 10
+  partial_fill: true
+
+scheduler:
+  jobs:
+    - name: daily_backfill
+      type: data.collect
+      cron: "0 */6 * * *"
+    - name: daily_reconcile
+      type: trade.reconcile
+      cron: "0 0 * * *"
+
+logging:
+  level: INFO
+  json_lines: true
+  dir: ./data/logs
+
+alerts:
+  channel: log

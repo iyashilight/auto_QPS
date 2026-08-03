@@ -1,0 +1,105 @@
+[project]
+name = "autoqps"
+version = "0.1.0"
+description = "个人加密货币中频量化交易系统"
+authors = [
+    { name = "iyashilight", email = "iyashituzuru@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    # 数据处理
+    "polars>=1.0",
+    "numpy>=1.26",
+    "pydantic>=2.5",
+    # 存储
+    "duckdb>=0.10",
+    # 网络
+    "httpx>=0.27",
+    "websockets>=12.0",
+    # CLI
+    "typer>=0.12",
+    "rich>=13.0",
+    # 配置
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # 测试
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    # 质量
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+qps = "qps.control.cli.app:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qps"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+markers = [
+    "unit: 单元测试",
+    "contract: 契约测试",
+    "integration: 集成测试",
+    "slow: 慢速测试",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",  # 行长度由 formatter 处理
+    "RUF001",  # 字符串中的中文全角标点（项目注释用中文）
+    "RUF002",  # docstring 中的中文全角标点（项目注释用中文）
+    "RUF003",  # 注释中的中文全角标点（项目注释用中文）
+    "B008",    # typer.Argument/Option 在参数默认值中（typer 惯用法）
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["qps"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["yaml.*"]
+ignore_missing_imports = true

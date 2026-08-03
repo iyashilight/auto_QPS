@@ -1,0 +1,16 @@
+# 模拟盘覆盖配置
+# 加载顺序：default.yaml → paper.yaml → 环境变量
+
+exchange:
+  adapters:
+    binance:
+      testnet: false
+      api_key: ${QPS_BINANCE_API_KEY}
+      api_secret: ${QPS_BINANCE_API_SECRET}
+
+paper:
+  fill_latency_ms: 10
+  partial_fill: true
+
+logging:
+  level: DEBUG

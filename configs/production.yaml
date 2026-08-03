@@ -1,0 +1,20 @@
+# 实盘覆盖配置
+# 加载顺序：default.yaml → production.yaml → 环境变量
+# ⚠️ 实盘模式必须通过环境变量设置密钥
+
+exchange:
+  adapters:
+    binance:
+      testnet: false
+      api_key: ${QPS_BINANCE_API_KEY}
+      api_secret: ${QPS_BINANCE_API_SECRET}
+
+risk:
+  account:
+    max_total_notional: 5000
+    max_daily_loss: 200
+    max_total_drawdown: 0.10
+    max_combined_leverage: 2
+
+logging:
+  level: WARNING
