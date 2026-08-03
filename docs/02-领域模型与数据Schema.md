@@ -115,9 +115,9 @@ models/
 
 **OrderBookSnapshot**：`instrument_id + ts`；字段 `bids[{price, qty}], asks[{price, qty}], exchange_ts`（低频采样，如每 1m/5m）
 
-**FundingRate**：`instrument_id + funding_ts`；字段 `rate, predicted_rate?, settlement_ts, interval`
+**FundingRate**：`instrument_id + funding_ts`；字段 `rate, predicted_rate?, settlement_ts, interval, data_version`（M1.4 新增 data_version）
 
-**OpenInterest**：`instrument_id + ts`；字段 `oi_value, oi_contracts, exchange_ts`
+**OpenInterest**：`instrument_id + ts`；字段 `oi_value, oi_contracts, exchange_ts, data_version`（M1.4 新增 data_version）
 
 **MarkPrice**：`instrument_id + ts`；字段 `mark_price, index_price, exchange_ts`
 
@@ -513,14 +513,22 @@ Raw 层（`data/raw/<source>/<exchange>/<instrument>/<data_type>/<YYYY-MM-DD>/`�
 ```
 data/raw/binance/btcusdt-perp/klines/2026-08-01/part-000.parquet
 data/raw/binance/btcusdt-perp/funding/2026-08-01/part-000.parquet
+data/raw/binance/btcusdt-perp/open_interest/2026-08-01/part-000.parquet
 data/raw/news/binance-announcement/2026-08-01/part-000.parquet   # 原始新闻（含原文/来源/时间）
 ```
 
 Normalized 层（`data/normalized/<interval>/<instrument>/`）：
 
 ```
-data/normalized/5m/btc-usdt-perp/2026.parquet   # 按年分片
+data/normalized/5m/btc-usdt-perp/2026.parquet   # K 线按年分片
 data/normalized/5m/btc-usdt-perp/2027.parquet
+```
+
+**资金费率与持仓量 Normalized 分区**（M1.4 新增）：
+
+```
+data/normalized/funding/btc-usdt-perp/2026.parquet   # 资金费率按年分片
+data/normalized/open_interest/btc-usdt-perp/2026.parquet   # 持仓量按年分片
 ```
 
 Feature 层（`data/features/<feature_version>/<interval>/`）：同 Normalized 分片方式。

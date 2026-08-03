@@ -130,6 +130,15 @@ class TestBinanceExchangeAdapter:
         assert "testnet" in adapter._base_url
         assert "testnet" in adapter._ws_base_url
 
+    def test_futures_testnet_url_override(self) -> None:
+        """永续合约测试网使用独立主机（非现货测试网）"""
+        adapter = self._make_adapter(testnet=True)
+        # 永续合约测试网应使用 binancefuture.com，而非 binance.vision
+        assert "binancefuture.com" in adapter._futures_base_url
+        assert "stream.binancefuture.com" in adapter._futures_ws_base_url
+        # 现货测试网仍使用 binance.vision
+        assert "binance.vision" in adapter._base_url
+
     def test_status_disconnected(self) -> None:
         """未连接时状态正确"""
         adapter = self._make_adapter()
@@ -185,9 +194,9 @@ class TestBinanceExchangeAdapter:
         adapter = self._make_adapter()
 
         # Mock __init__ of httpx.AsyncClient to raise ConnectError (模拟底层连接失败)
-        with patch("httpx.AsyncClient.__init__", side_effect=httpx.ConnectError("连接失败")):
-            with pytest.raises((BrokerNetworkError, httpx.ConnectError)):
-                await adapter.connect()
+        with patch("httpx.AsyncClient.__init__", side_effect=httpx.ConnectError("连接失败")), \
+             pytest.raises((BrokerNetworkError, httpx.ConnectError)):
+            await adapter.connect()
 
     def test_sign_params(self) -> None:
         """HMAC-SHA256 签名正确"""

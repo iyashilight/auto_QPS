@@ -363,7 +363,7 @@ class TestFundingRateNormalization:
             _make_funding_rate(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC), rate=Decimal("2.0")),
         ]
 
-        result, report = normalizer.normalize_funding_rates(rates, "binance-btc-usdt-perp")
+        _, report = normalizer.normalize_funding_rates(rates, "binance-btc-usdt-perp")
         assert report.suspect_bars == 1
 
     def test_write_normalized_funding_rates(self, tmp_path: Path) -> None:
@@ -413,7 +413,7 @@ class TestOpenInterestNormalization:
             _make_oi(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC), oi_value=Decimal("-100")),
         ]
 
-        result, report = normalizer.normalize_open_interest(oi_list, "binance-btc-usdt-perp")
+        _, report = normalizer.normalize_open_interest(oi_list, "binance-btc-usdt-perp")
         assert report.suspect_bars == 1
 
     def test_write_normalized_oi(self, tmp_path: Path) -> None:
