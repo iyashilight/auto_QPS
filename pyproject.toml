@@ -81,6 +81,11 @@ ignore = [
     "B008",    # typer.Argument/Option 在参数默认值中（typer 惯用法）
 ]
 
+# Pydantic v2 模型文件需要运行时访问 datetime/枚举/Decimal，
+# 不能放入 TYPE_CHECKING 块，因此对模型文件豁免 TC 规则
+[tool.ruff.lint.per-file-ignores]
+"src/qps/core/models/*.py" = ["TC001", "TC002", "TC003"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["qps"]
 

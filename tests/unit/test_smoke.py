@@ -33,20 +33,20 @@ def test_constants_enums() -> None:
     """常量枚举值正确"""
     from qps.core.constants import AssetClass, OrderStatus, StrategyLifecycleStatus
 
-    assert AssetClass.SPOT == "spot"
-    assert AssetClass.PERPETUAL == "perpetual"
+    assert AssetClass.SPOT == "SPOT"
+    assert AssetClass.PERPETUAL == "PERPETUAL"
     assert OrderStatus.FILLED == "FILLED"
-    assert StrategyLifecycleStatus.DRAFT == "Draft"
+    assert StrategyLifecycleStatus.DRAFT == "DRAFT"
 
 
 def test_event_types_defined() -> None:
     """事件类型常量已定义"""
     from qps.core.events import EventType
 
-    assert EventType.BAR_RECEIVED == "bar.received"
-    assert EventType.TRADING_INTENT_CREATED == "trading_intent.created"
-    assert EventType.RISK_CHECK_BLOCKED == "risk_check.blocked"
-    assert EventType.ORDER_FILLED == "order.filled"
+    assert EventType.BAR_UPDATED == "BAR_UPDATED"
+    assert EventType.INTENT_CREATED == "INTENT_CREATED"
+    assert EventType.RISK_EVENT == "RISK_EVENT"
+    assert EventType.ORDER_UPDATED == "ORDER_UPDATED"
 
 
 def test_error_hierarchy() -> None:

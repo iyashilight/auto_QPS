@@ -85,37 +85,42 @@ source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
     { name = "httpx" },
-    { name = "mypy" },
     { name = "numpy" },
     { name = "polars" },
     { name = "pydantic" },
+    { name = "pyyaml" },
+    { name = "rich" },
+    { name = "typer" },
+    { name = "websockets" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
-    { name = "pyyaml" },
-    { name = "rich" },
     { name = "ruff" },
-    { name = "typer" },
-    { name = "websockets" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "duckdb", specifier = ">=0.10" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "mypy", specifier = ">=1.10" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "polars", specifier = ">=1.0" },
     { name = "pydantic", specifier = ">=2.5" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "pytest-cov", specifier = ">=5.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.0" },
-    { name = "ruff", specifier = ">=0.5" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "typer", specifier = ">=0.12" },
     { name = "websockets", specifier = ">=12.0" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "certifi"
