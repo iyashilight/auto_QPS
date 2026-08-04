@@ -24,6 +24,7 @@ LOG_ID_PREFIX: str = "log_"
 CHECK_ID_PREFIX: str = "chk_"
 RISK_EVENT_ID_PREFIX: str = "re_"
 RUN_ID_PREFIX: str = "run_"
+OPTIMIZATION_RUN_ID_PREFIX: str = "opt_"
 JOB_ID_PREFIX: str = "job_"
 
 
