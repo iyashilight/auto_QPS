@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import logging
 import random
 from datetime import UTC, datetime, timedelta
@@ -74,17 +75,24 @@ class Optimizer:
     async def stop(self, run_id: str) -> None:
         """停止搜索（幂等，置 CANCELED 状态）"""
         self._active_runs[run_id] = True
-        # 更新状态为 CANCELED
-        try:
-            store = self._get_experiment_store()
-            with store._meta_db.transaction() as conn:
-                # 状态更新走专用通道（insert-only 兼容：先检查是否有 status 更新触发器）
-                conn.execute(
-                    "UPDATE experiments SET status = ? WHERE run_id = ?",
-                    (ExperimentStatus.CANCELED.value, run_id),
-                )
-        except Exception:
-            logger.exception("停止优化状态更新失败: %s", run_id)
+        # 更新状态为 CANCELED（写库失败不静默，抛错）
+        store = self._get_experiment_store()
+        with store._meta_db.transaction() as conn:
+            conn.execute(
+                "UPDATE experiments SET status = ? WHERE run_id = ?",
+                (ExperimentStatus.CANCELED.value, run_id),
+            )
+            # 记录状态变更事件
+            conn.execute(
+                "INSERT INTO experiment_events (event_id, run_id, event_type, event_data, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    f"evt_{run_id}_canceled",
+                    run_id,
+                    "STATUS_CHANGE",
+                    json.dumps({"from": "RUNNING", "to": "CANCELED"}),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
 
     async def status(self, run_id: str) -> OptimizationRun:
         """查询搜索状态"""
@@ -126,12 +134,9 @@ class Optimizer:
             created_at=datetime.now(UTC),
         )
 
-        # 保存初始记录（写库失败不静默）
-        try:
-            store = self._get_experiment_store()
-            await store.create_run(run)
-        except Exception:
-            logger.exception("优化初始记录写入失败: %s（R4/R5 红线）", run_id)
+        # 保存初始记录（写库失败不静默，抛错）
+        store = self._get_experiment_store()
+        await store.create_run(run)
 
         for i, params in enumerate(param_combos[:budget]):
             # 检查是否应该停止
@@ -201,19 +206,16 @@ class Optimizer:
             created_at=run.created_at,
         )
 
-        # 保存最终记录（写库失败不静默）
-        try:
-            store = self._get_experiment_store()
-            await self._update_run(
-                run_id=run_id,
-                evaluations=evaluations,
-                best_params=best_params,
-                best_metrics=best_metrics,
-                walkforward_report=walkforward_report,
-                status=final_run.status,
-            )
-        except Exception:
-            logger.exception("优化最终记录写入失败: %s（R4/R5 红线）", run_id)
+        # 保存最终记录（写库失败不静默，抛错）
+        store = self._get_experiment_store()
+        await self._update_run(
+            run_id=run_id,
+            evaluations=evaluations,
+            best_params=best_params,
+            best_metrics=best_metrics,
+            walkforward_report=walkforward_report,
+            status=final_run.status,
+        )
 
         return final_run
 
@@ -489,11 +491,18 @@ class Optimizer:
 
     @staticmethod
     def _generate_run_id(req: OptimizationRequest) -> str:
-        """生成确定性 run_id（含请求内容 hash 确保唯一性）"""
+        """生成确定性 run_id（含请求内容 hash + uuid4 确保唯一性）
+
+        格式：opt_<timestamp>_<contenthash8>_<uuid4>
+        同秒同请求两次运行必须不同 run_id（uuid4 保证）。
+        """
+        import uuid
+
         content = f"{req.strategy_id}:{req.algorithm.value}:{req.random_seed}:{req.budget}"
         content_hex = hashlib.sha256(content.encode()).hexdigest()[:8]
         ts = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        return f"{OPTIMIZATION_RUN_ID_PREFIX}{ts}_{content_hex}"
+        uid = uuid.uuid4().hex[:4]
+        return f"{OPTIMIZATION_RUN_ID_PREFIX}{ts}_{content_hex}_{uid}"
 
     @staticmethod
     def _parse_request(request: dict[str, Any]) -> OptimizationRequest:
@@ -542,19 +551,48 @@ class Optimizer:
     ) -> None:
         """增量更新优化运行记录
 
-        insert-only 兼容：状态更新走专用通道（允许 status 列更新，
-        其余字段通过 params 存储），不使用 UPDATE 修改 params 等字段。
+        insert-only 兼容：
+        - status 更新走 experiments 表（触发器放行 status 列）
+        - evaluations 增量落盘走 experiment_events 表（insert-only）
+        - 写库失败不静默，抛错（R4/R5 红线）
         """
         store = self._get_experiment_store()
-        # 状态更新：仅更新 status 列（insert-only 触发器可能放行 status 列更新）
-        try:
-            with store._meta_db.transaction() as conn:
+        # 状态更新：仅更新 status 列（触发器放行 status 列更新）
+        with store._meta_db.transaction() as conn:
+            conn.execute(
+                "UPDATE experiments SET status = ? WHERE run_id = ?",
+                (status.value, run_id),
+            )
+            # evaluations 增量落盘：只写新增的 evaluations
+            # 查询已有 evaluations 数量
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM experiment_events WHERE run_id = ? AND event_type = 'EVALUATION'",
+                (run_id,),
+            ).fetchone()[0]
+            for i in range(existing, len(evaluations)):
+                eval_record = evaluations[i]
                 conn.execute(
-                    "UPDATE experiments SET status = ? WHERE run_id = ?",
-                    (status.value, run_id),
+                    "INSERT INTO experiment_events (event_id, run_id, event_type, event_data, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        f"evt_{run_id}_eval_{i}",
+                        run_id,
+                        "EVALUATION",
+                        json.dumps(eval_record, default=str),
+                        datetime.now(UTC).isoformat(),
+                    ),
                 )
-        except Exception:
-            logger.exception("优化状态更新失败: %s（可能触发器冲突）", run_id)
+            # 记录 best_params 更新事件
+            if best_params is not None:
+                conn.execute(
+                    "INSERT INTO experiment_events (event_id, run_id, event_type, event_data, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        f"evt_{run_id}_best_{len(evaluations)}",
+                        run_id,
+                        "BEST_UPDATE",
+                        json.dumps({"best_params": best_params, "score": str(evaluations[-1].get("score", "")) if evaluations else ""}, default=str),
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
 
     def _get_backtest_engine(self) -> EventDrivenBacktestEngine:
         """获取回测引擎"""

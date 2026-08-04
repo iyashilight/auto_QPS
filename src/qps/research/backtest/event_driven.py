@@ -176,7 +176,7 @@ class EventDrivenBacktestEngine:
         fill_timing = FillTiming.NEXT_BAR_OPEN
 
         # 加载策略（按 strategy_id + version_no）
-        strategy_instance, signal_source = self._load_strategy(req)
+        strategy_instance, signal_source = await self._load_strategy(req)
 
         # 逐 bar 模拟
         bar_lists = {iid: list(bars) for iid, bars in all_bars.items()}
@@ -360,7 +360,7 @@ class EventDrivenBacktestEngine:
 
     # ── 策略加载 ──────────────────────────────────────────
 
-    def _load_strategy(
+    async def _load_strategy(
         self, req: BacktestRequest,
     ) -> tuple[Any, str]:
         """加载策略代码包
@@ -373,11 +373,8 @@ class EventDrivenBacktestEngine:
         """
         try:
             registry = self._container.get_port("strategy_registry")
-            # 同步调用 get_version（registry 是同步实现，用 asyncio.run 适配）
-            import asyncio
-            version_info = asyncio.get_event_loop().run_until_complete(
-                registry.get_version(req.strategy_id, req.version_no),
-            )
+            # 在 async 调用链内直接 await（禁止 get_event_loop().run_until_complete()）
+            version_info = await registry.get_version(req.strategy_id, req.version_no)
 
             # 从 code_ref 加载策略代码
             code_ref = version_info.code_ref
@@ -763,12 +760,18 @@ class EventDrivenBacktestEngine:
 
     @staticmethod
     def _generate_run_id(req: BacktestRequest) -> str:
-        """生成确定性 run_id（含请求内容 hash 确保唯一性）"""
-        # 包含 strategy_id + instruments + start + end + params 避免同秒冲突
+        """生成确定性 run_id（含请求内容 hash + uuid4 确保唯一性）
+
+        格式：bt_<timestamp>_<contenthash8>_<uuid4>
+        同秒同请求两次运行必须不同 run_id（uuid4 保证）。
+        """
+        import uuid
+
         content = f"{req.strategy_id}:{','.join(req.instruments)}:{req.start.isoformat()}:{req.end.isoformat()}:{req.random_seed}"
         content_hex = hashlib.sha256(content.encode()).hexdigest()[:8]
         ts = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        return f"{BACKTEST_RUN_ID_PREFIX}{ts}_{content_hex}"
+        uid = uuid.uuid4().hex[:4]
+        return f"{BACKTEST_RUN_ID_PREFIX}{ts}_{content_hex}_{uid}"
 
     def _compute_env_lock(self) -> str:
         """计算环境锁（uv.lock hash，基于仓库根解析）"""

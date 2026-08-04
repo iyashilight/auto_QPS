@@ -79,16 +79,41 @@ class MetaDB:
     def enforce_insert_only(self, table_name: str, conn: sqlite3.Connection) -> None:
         """强制 insert-only 约束
 
-        为指定表创建触发器，禁止 UPDATE 和 DELETE。
+        对 experiments 表：仅拦截内容列变更，放行 status 列更新
+        （R4 语义：实验记录只增不改，但 status 是状态机迁移的合法通道）。
+        对其他表（如 audit_log）：无条件禁止 UPDATE 和 DELETE。
         """
-        # 禁止 UPDATE
-        conn.execute(f"""
-            CREATE TRIGGER IF NOT EXISTS _no_update_{table_name}
-            BEFORE UPDATE ON {table_name}
-            BEGIN
-                SELECT RAISE(ABORT, 'INSERT-ONLY 表禁止 UPDATE: {table_name}');
-            END
-        """)
+        if table_name == "experiments":
+            # experiments 表：放行仅 status 列变更的 UPDATE，拦截其他列变更
+            # 使用 WHEN 子句：只有当非 status 列发生变更时才触发 RAISE
+            conn.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS _no_update_{table_name}
+                BEFORE UPDATE ON {table_name}
+                FOR EACH ROW
+                WHEN COALESCE(NEW.run_type, '') <> COALESCE(OLD.run_type, '')
+                  OR COALESCE(NEW.strategy_id, '') <> COALESCE(OLD.strategy_id, '')
+                  OR NEW.version_no <> OLD.version_no
+                  OR COALESCE(NEW.params, '') <> COALESCE(OLD.params, '')
+                  OR COALESCE(NEW.data_version, '') <> COALESCE(OLD.data_version, '')
+                  OR COALESCE(NEW.feature_version, '') <> COALESCE(OLD.feature_version, '')
+                  OR COALESCE(NEW.engine_config, '') <> COALESCE(OLD.engine_config, '')
+                  OR COALESCE(NEW.environment_lock, '') <> COALESCE(OLD.environment_lock, '')
+                  OR COALESCE(NEW.start_ts, '') <> COALESCE(OLD.start_ts, '')
+                  OR COALESCE(NEW.end_ts, '') <> COALESCE(OLD.end_ts, '')
+                  OR COALESCE(NEW.created_at, '') <> COALESCE(OLD.created_at, '')
+                BEGIN
+                    SELECT RAISE(ABORT, 'INSERT-ONLY 表禁止内容列 UPDATE: {table_name}');
+                END
+            """)
+        else:
+            # 其他表：无条件禁止 UPDATE
+            conn.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS _no_update_{table_name}
+                BEFORE UPDATE ON {table_name}
+                BEGIN
+                    SELECT RAISE(ABORT, 'INSERT-ONLY 表禁止 UPDATE: {table_name}');
+                END
+            """)
         # 禁止 DELETE
         conn.execute(f"""
             CREATE TRIGGER IF NOT EXISTS _no_delete_{table_name}
@@ -212,6 +237,18 @@ CREATE TABLE IF NOT EXISTS experiments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_experiments_strategy ON experiments(strategy_id, version_no);
+
+-- 实验事件（增量 evaluations 落盘，insert-only）
+CREATE TABLE IF NOT EXISTS experiment_events (
+    event_id    TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    event_type  TEXT NOT NULL CHECK (event_type IN ('EVALUATION','STATUS_CHANGE','BEST_UPDATE')),
+    event_data  TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES experiments(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_events_run ON experiment_events(run_id);
 
 -- 报告卡
 CREATE TABLE IF NOT EXISTS report_cards (

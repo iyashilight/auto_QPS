@@ -135,7 +135,27 @@ class ExperimentStore:
                 created_at=created_at,
             )
 
-        # OptimizationRun：从 params 恢复完整字段
+        # OptimizationRun：从 params + experiment_events 恢复完整字段
+        # 从 experiment_events 读取增量 evaluations
+        with self._meta_db.connect() as conn:
+            event_rows = conn.execute(
+                "SELECT event_data FROM experiment_events WHERE run_id = ? AND event_type = 'EVALUATION' ORDER BY created_at",
+                (run_id,),
+            ).fetchall()
+        evaluations = [json.loads(r["event_data"]) for r in event_rows] if event_rows else params.get("evaluations", [])
+
+        # 从 experiment_events 读取最新的 best_params
+        with self._meta_db.connect() as conn:
+            best_row = conn.execute(
+                "SELECT event_data FROM experiment_events WHERE run_id = ? AND event_type = 'BEST_UPDATE' ORDER BY created_at DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if best_row:
+            best_data = json.loads(best_row["event_data"])
+            best_params = best_data.get("best_params", params.get("best_params"))
+        else:
+            best_params = params.get("best_params")
+
         return OptimizationRun(
             run_id=row["run_id"],
             strategy_id=row["strategy_id"],
@@ -143,8 +163,8 @@ class ExperimentStore:
             search_space=params.get("search_space", {}),
             objective=params.get("objective", {}),
             algorithm=params.get("algorithm", "GRID"),
-            evaluations=params.get("evaluations", []),
-            best_params=params.get("best_params"),
+            evaluations=evaluations,
+            best_params=best_params,
             walkforward_report=params.get("walkforward_report"),
             data_version=row["data_version"],
             feature_version=row["feature_version"],

@@ -137,7 +137,7 @@ class TestMetaDBInsertOnly:
     """历史记录 insert-only 约束"""
 
     def test_experiments_no_update(self, meta_db: MetaDB) -> None:
-        """experiments 表禁止 UPDATE"""
+        """experiments 表禁止内容列 UPDATE（status 列更新允许）"""
         meta_db.setup_insert_only_constraints()
 
         now = datetime.now(UTC).isoformat()
@@ -151,9 +151,17 @@ class TestMetaDBInsertOnly:
             )
             conn.commit()
 
+            # UPDATE status 列应成功（R4 语义：status 是状态机迁移的合法通道）
+            conn.execute(
+                "UPDATE experiments SET status = 'SUCCEEDED' WHERE run_id = ?",
+                ("bt_001",),
+            )
+            conn.commit()
+
+            # UPDATE 内容列应被阻止
             with pytest.raises(Exception, match="INSERT-ONLY"):
                 conn.execute(
-                    "UPDATE experiments SET status = 'SUCCEEDED' WHERE run_id = ?",
+                    "UPDATE experiments SET params = '{\"changed\": true}' WHERE run_id = ?",
                     ("bt_001",),
                 )
 

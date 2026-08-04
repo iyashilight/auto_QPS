@@ -467,8 +467,20 @@ CREATE TABLE experiments (
     feature_version   TEXT NOT NULL,
     engine_config     TEXT NOT NULL,        -- JSON
     environment_lock  TEXT,
+    start_ts          TEXT,                 -- 数据范围开始时间（ISO8601）
+    end_ts            TEXT,                 -- 数据范围结束时间（ISO8601）
     status            TEXT NOT NULL,
     created_at        TEXT NOT NULL
+);
+
+-- 实验事件（增量 evaluations 落盘，insert-only）
+CREATE TABLE experiment_events (
+    event_id    TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    event_type  TEXT NOT NULL CHECK (event_type IN ('EVALUATION','STATUS_CHANGE','BEST_UPDATE')),
+    event_data  TEXT NOT NULL,              -- JSON
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES experiments(run_id)
 );
 
 CREATE TABLE report_cards (
