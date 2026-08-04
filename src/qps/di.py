@@ -169,9 +169,12 @@ def build_container(config: Config) -> Container:
     register_mvp_features(feature_engine)
     container.register_port("feature_pipeline", feature_engine)
 
-    # ── 占位端口（后续里程碑实现）────────────────────────────
+    # ── M1: Data Provider ─────────────────────────────────
+    from qps.data.provider import DataProvider
+
+    data_provider = DataProvider(config.data_dir)
+    container.register_port("data_provider", data_provider)
     _port_names = [
-        "data_provider",
         "broker_adapter",
         "backtest_engine",
         "optimizer",

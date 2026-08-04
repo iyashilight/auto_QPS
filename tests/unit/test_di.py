@@ -79,9 +79,9 @@ class TestBuildContainer:
     def test_port_not_implemented_raises(self, test_config: Config) -> None:
         """占位端口调用抛 NotImplementedError"""
         container = build_container(test_config)
-        port = container.get_port("data_provider")
+        port = container.get_port("backtest_engine")
         with pytest.raises(NotImplementedError, match="尚未实现"):
-            port.get_bars("test", "5m", None, None)
+            port.run({})
 
     def test_get_missing_port_raises(self, test_config: Config) -> None:
         """获取未注册端口抛 KeyError"""
@@ -130,7 +130,7 @@ class TestBuildTestContainer:
     def test_replace_port_returns_old(self, test_config: Config) -> None:
         """替换端口返回旧实现"""
         container = build_container(test_config)
-        old = container.replace_port("data_provider", _NotImplementedPort())
+        old = container.replace_port("backtest_engine", _NotImplementedPort())
         assert isinstance(old, _NotImplementedPort)
 
     def test_register_custom_port(self, test_config: Config) -> None:
