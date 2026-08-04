@@ -384,6 +384,41 @@ models/
 | L5 | 宏观数据 | FRED/Yahoo Finance | M7+ |
 | L6 | 社交媒体 | X/Reddit/Telegram | M7+ 后期 |
 
+### 3.10 市场状态工件（二期 v0.4-2 §14/§24.1 预登记）
+
+> M4 起随 Regime Detection 落地；只读软信号，策略无权修改（docs/04 §4）。
+
+**MarketRegime**（Regime 判定输出）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| regime_id / instrument_id / ts | str/str/datetime(UTC) | 唯一 ID、标的、评估时间 |
+| regime | enum | `TRENDING_UP / TRENDING_DOWN / RANGING / HIGH_VOLATILITY / CRISIS / RECOVERY` |
+| confidence | Decimal(0~1) | 置信度 |
+| volatility_state | enum | `LOW / NORMAL / HIGH / EXTREME` |
+| volume_state | enum | `BELOW_AVERAGE / AVERAGE / ABOVE_AVERAGE / ABNORMAL` |
+| trend_strength | Decimal(0~1) | 趋势强度 |
+| feature_version / data_version | str | 特征/数据版本（R5） |
+
+**SentimentState**（情绪聚合输出，M5）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| sentiment_id / instrument_id / ts | str/str/datetime(UTC) | 唯一 ID、标的、评估时间 |
+| score | Decimal(-1~1) | 聚合情绪分（新闻+funding+OI） |
+| confidence | Decimal(0~1) | 置信度 |
+| components | dict | 各来源分项（news/funding/oi） |
+| data_version | str | 数据版本（R5） |
+
+**MarketState**（聚合市场状态，M5 末/M6）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| state_id / ts | str/datetime(UTC) | 唯一 ID、聚合时间 |
+| regime / sentiment / events | ref | 引用 MarketRegime / SentimentState / NewsEvent 列表 |
+| overall_risk_posture | enum | `NORMAL / CAUTION / DEFENSIVE / HALT` |
+| alpha_environment | enum | `FAVORABLE / MODERATE / HOSTILE` |
+
 ## 4. 存储 Schema
 
 ### 4.1 SQLite 元数据库（`data/meta.db`）
