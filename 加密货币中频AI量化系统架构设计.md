@@ -1,6 +1,7 @@
 # 个人加密货币中频 AI 量化交易系统架构设计
 
 > 版本：v0.4（新增：事件驱动多 Agent 架构、规则版新闻风控提前至 M5/M6、Coordinator 战略层边界、风险模式状态机；并同步 MVP 里程碑编号）
+> 二期补充：`加密货币中频AI量化系统架构设计-第二期.md`（v0.4-2）——从 MVP 交易系统升级为 AI Quant Research Platform；选择性并入一期的范围见 `docs/decisions/ADR-006-selective-phase2-integration.md`
 > 定位：个人单机使用的量化研究与自动交易平台，非 SaaS、非多用户
 > 市场：加密货币（现货 Spot + 永续合约 Perpetual Futures），MVP 优先支持主流交易所
 > 频率：中频；默认研究频率 5m / 15m / 1h（1m 仅用于候选策略精细验证），不考虑毫秒级高频，但架构不排斥未来扩展
