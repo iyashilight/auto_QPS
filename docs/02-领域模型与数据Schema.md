@@ -286,6 +286,26 @@ models/
 
 **ReportCard**：`run_id + strategy_id + version_no`；字段 `metrics, gate_results{draft→bt, bt→validated, ...}, conclusion`
 
+**AlphaScore**（信号/策略评估，二期 v0.4-2 §16 预登记，M3 起随回测产出）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| score_id | str | 唯一 ID |
+| strategy_id / version_no | str/int | 评估对象 |
+| evaluated_at | datetime(UTC) | 评估时间 |
+| run_id | str | 来源回测/优化运行（R5 可追溯） |
+| opportunity | Decimal(0~1) | 机会频率 |
+| confidence | Decimal(0~1) | 置信度 |
+| stability | Decimal(0~1) | 稳定性 |
+| market_fit | Decimal(0~1) | 市场适配度 |
+| decay_rate | Decimal(0~1) | 衰减率 |
+| risk_cost | Decimal(0~1) | 风险成本 |
+| composite_score | Decimal(0~1) | 综合评分（公式可配置，可 null） |
+| trend | enum | `IMPROVING / STABLE / DECLINING` |
+| recommended_weight_adjustment | enum | `INCREASE / MAINTAIN / REDUCE / PAUSE` |
+
+> M3 只要求维度定义 + 信号级评分随 ReportCard 产出；策略级评分、动态权重、实盘校准分别在 M4/M5/M6 启用（见 ADR-006）。
+
 ### 3.7 风控与审计
 
 **RiskRule**：`rule_id` 唯一；字段 `level(ACCOUNT/STRATEGY/ORDER/MARKET), rule_type, params(dict), enabled, version, updated_by, updated_at`
@@ -349,6 +369,20 @@ models/
 | strategy_preference | list[dict] | 否 | `[{strategy_id, action(ENABLE/DISABLE/KEEP/REDUCE_WEIGHT), weight?}]`（软生效，见架构 §2.7.7） |
 | reason_refs | list[str] | 是 | 触发事件/状态工件 ID（审计） |
 | raw | dict | 否 | Coordinator 原始输出 |
+
+### 3.9 数据来源分级（二期 v0.4-2 §18 预登记）
+
+> 分级用于数据治理与 Alpha Score 贡献度评估；本阶段只登记 taxonomy，L2+ 采集按各自里程碑推进。
+
+| Level | 内容 | 示例来源 | 落地阶段 |
+| --- | --- | --- | --- |
+| L0 | 基础行情（K 线/funding/OI） | Binance 免费 API | M1 ✅ 已落地 |
+| L1 | 规范化/特征数据 | 内部管线 | M1 ✅ 已落地 |
+| L2 | 衍生品深度（订单簿/买卖压力/CVD） | Binance Depth API | M3+（滑点建模假设，MVP 不采集） |
+| L3 | 链上数据 | Glassnode/CryptoQuant（付费） | M7+（见二期 §19，本阶段不做） |
+| L4 | 新闻数据（官方公告/RSS） | Binance 公告/CoinDesk RSS | M5/M6（一期已规划） |
+| L5 | 宏观数据 | FRED/Yahoo Finance | M7+ |
+| L6 | 社交媒体 | X/Reddit/Telegram | M7+ 后期 |
 
 ## 4. 存储 Schema
 
