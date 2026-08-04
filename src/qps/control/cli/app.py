@@ -845,16 +845,33 @@ def experiment_rerun(
     json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """重跑实验（确定性：结果必须与原始 run 一致）"""
+    from qps.core.models.experiment import BacktestRun
     from qps.di import build_container
     from qps.infra.config import Config
     from qps.research.backtest.event_driven import EventDrivenBacktestEngine
+    from qps.research.experiments import ExperimentStore
 
     async def _run() -> None:
         config = Config()
         container = build_container(config)
-        engine = EventDrivenBacktestEngine(container)
+        store = ExperimentStore(
+            meta_db=container.meta_db,
+            data_dir=config.data_dir,
+        )
 
         try:
+            # 按原运行 engine_mode 选择引擎（向量化 run 用向量化引擎重跑）
+            original = await store.get_run(run_id)
+            if not isinstance(original, BacktestRun):
+                typer.echo(f"❌ run_id {run_id} 不是回测运行", err=True)
+                raise typer.Exit(code=1)
+            engine_mode = original.engine_config.get("engine_mode", "EVENT_DRIVEN")
+            engine: EventDrivenBacktestEngine | VectorizedBacktestEngine
+            if engine_mode == "VECTORIZED":
+                from qps.research.backtest.vectorized import VectorizedBacktestEngine
+                engine = VectorizedBacktestEngine(container)
+            else:
+                engine = EventDrivenBacktestEngine(container)
             result = await engine.rerun(run_id)
         except Exception as e:
             typer.echo(f"❌ 重跑失败: {e}", err=True)

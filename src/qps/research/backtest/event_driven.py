@@ -75,8 +75,9 @@ class EventDrivenBacktestEngine:
         try:
             result = await self._execute_backtest(req, run_id)
             return result
-        except BacktestError:
-            raise
+        except BacktestError as e:
+            # 端口契约：失败必须返回 FAILED 记录而非抛异常
+            return self._failed_run(run_id, str(e), req)
         except Exception as e:
             logger.exception("回测执行失败: %s", run_id)
             return self._failed_run(run_id, str(e), request)
@@ -197,8 +198,40 @@ class EventDrivenBacktestEngine:
 
         # 策略上下文（用于策略执行路径）
         strategy_ctx: StrategyContext | None = None
+        feature_pipeline = None
+        current_bt_time: dict[str, datetime | None] | None = None
         if strategy_instance is not None:
             from qps.core.sdk.context import StrategyContext
+
+            # 加载策略声明的特征依赖，注入 feature_pipeline（当前 bar 时间锚点）
+            feature_names = self._load_strategy_feature_names(strategy_instance, req)
+            feature_map = await self._load_features(req, data_provider, feature_names)
+            current_bt_time = {"ts": None}
+
+            def _feature_pipeline(
+                instrument_id: str,
+                names: list[str],
+            ) -> dict[str, float]:
+                """返回截至当前 bar 的最新特征值（无未来数据）"""
+                ts = current_bt_time["ts"]
+                if ts is None:
+                    return {}
+                out: dict[str, float] = {}
+                by_instrument = feature_map.get(instrument_id, {})
+                for name in names:
+                    series = by_instrument.get(name, [])
+                    # series: [(ts, value), ...] 按 ts 升序
+                    latest = None
+                    for item_ts, item_value in series:
+                        if item_ts <= ts:
+                            latest = item_value
+                        else:
+                            break
+                    if latest is not None:
+                        out[name] = latest
+                return out
+
+            feature_pipeline = _feature_pipeline
             strategy_ctx = StrategyContext(
                 strategy_id=req.strategy_id,
                 version_no=req.version_no,
@@ -206,45 +239,45 @@ class EventDrivenBacktestEngine:
                 params=req.params,
                 instruments=req.instruments,
                 interval=req.interval,
+                feature_pipeline=feature_pipeline,
             )
             strategy_instance.initialize(strategy_ctx)
-
-        # 持仓历史（用于策略信号翻转平仓）
-        position_history: dict[str, str] = {}  # instrument_id → side
 
         for _event_time, instrument_id, bar in all_bar_events:
             # 防未来函数检查
             if instrument_id in processed_max_time and bar.open_time < processed_max_time[instrument_id]:
-                    raise BacktestError(
-                        detail=f"未来函数检测: {instrument_id} bar open_time={bar.open_time} "
-                               f"< 已处理 {processed_max_time[instrument_id]}"
-                    )
+                raise BacktestError(
+                    detail=f"未来函数检测: {instrument_id} bar open_time={bar.open_time} "
+                           f"< 已处理 {processed_max_time[instrument_id]}"
+                )
             processed_max_time[instrument_id] = bar.open_time
 
             # 处理挂单撮合
-            self._match_pending_signals(
+            cash += self._match_pending_signals(
                 pending_signals, bar, instrument_id, cost_calc,
                 cash, positions, trades, fill_timing,
             )
 
             # 资金费率结算
-            self._settle_funding(
+            cash += self._settle_funding(
                 instrument_id, bar, funding_rates, funding_idx,
                 positions, trades, cost_calc,
             )
 
             # 强平检查
-            self._check_liquidation(
+            cash += self._check_liquidation(
                 instrument_id, bar, mark_prices, mark_idx,
                 positions, trades, cost_calc, cash,
             )
 
             # 生成信号
             if strategy_instance is not None and strategy_ctx is not None:
+                if current_bt_time is not None:
+                    current_bt_time["ts"] = bar.open_time
                 # 策略执行路径：调用 on_bar，收集 emit_intent 输出
                 signals = self._execute_strategy_on_bar(
                     strategy_instance, strategy_ctx, bar, instrument_id,
-                    positions, position_history,
+                    positions,
                 )
             else:
                 # 内置信号（无策略时回退，含 OPEN + CLOSE）
@@ -255,7 +288,8 @@ class EventDrivenBacktestEngine:
 
             # 更新权益曲线
             unrealized = self._compute_unrealized_pnl(positions, bar, instrument_id)
-            equity = cash + unrealized
+            locked_margin = sum(p.margin for p in positions.values())
+            equity = cash + locked_margin + unrealized
             equity_curve.append(EquityPoint(
                 timestamp=bar.open_time,
                 equity=equity,
@@ -287,7 +321,7 @@ class EventDrivenBacktestEngine:
         # AlphaScore 注入固定 clock（确定性）
         alpha_score = compute_alpha_score(
             run_id, req.strategy_id, req.version_no, metrics,
-            evaluated_at=datetime.now(UTC),
+            evaluated_at=req.end,
         )
         report_card = ReportCardWithAlpha(report_card, alpha_score).to_report_card()
 
@@ -312,6 +346,8 @@ class EventDrivenBacktestEngine:
             "cost_config": req.cost_config.model_dump(),
             "leverage": str(req.leverage),
             "random_seed": req.random_seed,
+            "trades_ref": str(trades_ref),
+            "equity_curve_ref": str(equity_ref),
         }
 
         result = BacktestRun(
@@ -396,7 +432,12 @@ class EventDrivenBacktestEngine:
                         if (isinstance(attr, type)
                                 and issubclass(attr, BaseStrategy)
                                 and attr is not BaseStrategy):
-                            return attr(), "strategy"
+                            instance = attr()
+                            # 策略 yaml 声明的特征依赖（供回测引擎注入 feature_pipeline）
+                            feature_deps = getattr(version_info, "feature_dependencies", None)
+                            if isinstance(feature_deps, list) and feature_deps:
+                                instance.feature_dependencies = list(feature_deps)  # type: ignore[attr-defined]
+                            return instance, "strategy"
             logger.info("策略 %s v%d 加载失败，回退到内置信号", req.strategy_id, req.version_no)
         except Exception as e:
             logger.info("策略 %s v%d 加载异常: %s，回退到内置信号", req.strategy_id, req.version_no, e)
@@ -409,7 +450,6 @@ class EventDrivenBacktestEngine:
         bar: Bar,
         instrument_id: str,
         positions: dict[str, _Position],
-        position_history: dict[str, str],
     ) -> list[_Signal]:
         """执行策略 on_bar，收集 emit_intent 输出作为信号"""
         # 注入当前 bar 到上下文
@@ -555,6 +595,54 @@ class EventDrivenBacktestEngine:
 
         return signals
 
+    @staticmethod
+    def _load_strategy_feature_names(
+        strategy: Any,
+        req: BacktestRequest,
+    ) -> list[str]:
+        """从策略实例提取特征依赖（initialize 前的声明字段）"""
+        names: list[str] = []
+        for attr in ("feature_dependencies", "feature_names", "features"):
+            value = getattr(strategy, attr, None)
+            if isinstance(value, list):
+                names.extend(str(v) for v in value if v)
+        return sorted(set(names))
+
+    async def _load_features(
+        self,
+        req: BacktestRequest,
+        data_provider: DataProvider,
+        feature_names: list[str],
+    ) -> dict[str, dict[str, list[tuple[datetime, float]]]]:
+        """加载回测区间内的特征，按 instrument → name → [(ts, value)] 组织"""
+        if not feature_names:
+            return {}
+        feature_map: dict[str, dict[str, list[tuple[datetime, float]]]] = {}
+        for instrument_id in req.instruments:
+            try:
+                features = await data_provider.get_features(
+                    instrument_id=instrument_id,
+                    feature_names=feature_names,
+                    start=req.start,
+                    end=req.end,
+                    feature_version=req.feature_version,
+                )
+            except Exception:
+                logger.exception("加载特征失败: %s", instrument_id)
+                continue
+            by_name: dict[str, list[tuple[datetime, float]]] = {}
+            for fs in features:
+                try:
+                    value = float(fs.value)
+                except (TypeError, ValueError):
+                    continue
+                by_name.setdefault(fs.feature_name, []).append((fs.ts, value))
+            feature_map[instrument_id] = {
+                name: sorted(series, key=lambda x: x[0])
+                for name, series in by_name.items()
+            }
+        return feature_map
+
     # ── 撮合 ──────────────────────────────────────────────
 
     def _match_pending_signals(
@@ -567,9 +655,10 @@ class EventDrivenBacktestEngine:
         positions: dict[str, _Position],
         trades: list[TradeRecord],
         fill_timing: FillTiming,
-    ) -> None:
-        """撮合挂单"""
+    ) -> Decimal:
+        """撮合挂单，返回 cash 变动量（正=收入，负=支出）"""
         matched_indices: list[int] = []
+        cash_delta = Decimal("0")
 
         for i, signal in enumerate(pending):
             if signal.instrument_id != instrument_id:
@@ -594,6 +683,10 @@ class EventDrivenBacktestEngine:
 
             # 执行交易
             if signal.action == "OPEN":
+                # 已持仓时不重复开仓（策略路径可能重复发 OPEN）
+                if instrument_id in positions:
+                    matched_indices.append(i)
+                    continue
                 # 开仓
                 margin = cost_calc.compute_margin(signal.quantity, actual_price)
                 if margin > cash:
@@ -604,7 +697,9 @@ class EventDrivenBacktestEngine:
                     quantity=signal.quantity,
                     entry_price=actual_price,
                     margin=margin,
+                    opened_at=bar.open_time,
                 )
+                cash_delta -= margin + trade_cost.fee + trade_cost.slippage
 
                 trades.append(TradeRecord(
                     instrument_id=signal.instrument_id,
@@ -620,6 +715,7 @@ class EventDrivenBacktestEngine:
             elif signal.action == "CLOSE" and instrument_id in positions:
                 pos = positions[instrument_id]
                 pnl = self._compute_pnl(pos, actual_price)
+                cash_delta += pos.margin + pnl - trade_cost.fee - trade_cost.slippage
 
                 trades.append(TradeRecord(
                     instrument_id=signal.instrument_id,
@@ -640,6 +736,7 @@ class EventDrivenBacktestEngine:
         # 移除已撮合信号（倒序删除）
         for i in sorted(matched_indices, reverse=True):
             pending.pop(i)
+        return cash_delta
 
     def _settle_funding(
         self,
@@ -650,14 +747,15 @@ class EventDrivenBacktestEngine:
         positions: dict[str, _Position],
         trades: list[TradeRecord],
         cost_calc: CostCalculator,
-    ) -> None:
-        """资金费率结算"""
+    ) -> Decimal:
+        """资金费率结算，返回 cash 变动量（正=收取，负=支付）"""
         if instrument_id not in positions:
-            return
+            return Decimal("0")
 
         pos = positions[instrument_id]
         rates = funding_rates.get(instrument_id, [])
         idx = funding_idx.get(instrument_id, 0)
+        cash_delta = Decimal("0")
 
         while idx < len(rates):
             rate = rates[idx]
@@ -666,23 +764,27 @@ class EventDrivenBacktestEngine:
             if rate_ts > bar.open_time:
                 break
 
-            funding_cost = cost_calc.compute_funding_cost(
-                pos.quantity, bar.close, rate.rate, pos.side,
-            )
+            # 只结算持仓期间（rate_ts >= 开仓时间）的费率，开仓前的历史费率不归属当前持仓
+            if rate_ts >= pos.opened_at:
+                funding_cost = cost_calc.compute_funding_cost(
+                    pos.quantity, bar.close, rate.rate, pos.side,
+                )
+                cash_delta -= funding_cost
 
-            trades.append(TradeRecord(
-                instrument_id=instrument_id,
-                side=pos.side,
-                action="FUNDING",
-                quantity=pos.quantity,
-                price=bar.close,
-                timestamp=bar.open_time,
-                funding=funding_cost,
-            ))
+                trades.append(TradeRecord(
+                    instrument_id=instrument_id,
+                    side=pos.side,
+                    action="FUNDING",
+                    quantity=pos.quantity,
+                    price=bar.close,
+                    timestamp=bar.open_time,
+                    funding=funding_cost,
+                ))
 
             idx += 1
 
         funding_idx[instrument_id] = idx
+        return cash_delta
 
     def _check_liquidation(
         self,
@@ -694,10 +796,10 @@ class EventDrivenBacktestEngine:
         trades: list[TradeRecord],
         cost_calc: CostCalculator,
         cash: Decimal,
-    ) -> None:
-        """强平检查"""
+    ) -> Decimal:
+        """强平检查，返回 cash 变动量（回收保证金 + 已实现盈亏 - 成本）"""
         if instrument_id not in positions:
-            return
+            return Decimal("0")
 
         pos = positions[instrument_id]
 
@@ -719,6 +821,11 @@ class EventDrivenBacktestEngine:
         # 检查强平
         if cost_calc.is_liquidated(pos.side, pos.entry_price, mark_price):
             pnl = self._compute_pnl(pos, mark_price)
+            side = "BUY" if pos.side == "SHORT" else "SELL"
+            trade_cost = cost_calc.compute_trade_cost(
+                pos.quantity, mark_price, is_maker=False, side=side,
+            )
+            cash_delta = pos.margin + pnl - trade_cost.fee - trade_cost.slippage
 
             trades.append(TradeRecord(
                 instrument_id=instrument_id,
@@ -727,11 +834,15 @@ class EventDrivenBacktestEngine:
                 quantity=pos.quantity,
                 price=mark_price,
                 timestamp=bar.open_time,
+                fee=trade_cost.fee,
+                slippage=trade_cost.slippage,
                 pnl=pnl,
                 is_liquidation=True,
             ))
 
             del positions[instrument_id]
+            return cash_delta
+        return Decimal("0")
 
     # ── 辅助方法 ──────────────────────────────────────────
 
@@ -906,11 +1017,13 @@ class _Position:
         quantity: Decimal,
         entry_price: Decimal,
         margin: Decimal,
+        opened_at: datetime,
     ) -> None:
         self.side = side
         self.quantity = quantity
         self.entry_price = entry_price
         self.margin = margin
+        self.opened_at = opened_at
 
 
 class _Signal:

@@ -84,7 +84,7 @@ class Optimizer:
             )
             # 记录状态变更事件
             conn.execute(
-                "INSERT INTO experiment_events (event_id, run_id, event_type, event_data, created_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO experiment_events (event_id, run_id, event_type, event_data, created_at) VALUES (?, ?, ?, ?, ?)",
                 (
                     f"evt_{run_id}_canceled",
                     run_id,
@@ -513,9 +513,13 @@ class Optimizer:
         if request.get("start"):
             s = request["start"]
             start = datetime.fromisoformat(s) if isinstance(s, str) else s
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=UTC)
         if request.get("end"):
             e = request["end"]
             end = datetime.fromisoformat(e) if isinstance(e, str) else e
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=UTC)
 
         return OptimizationRequest(
             strategy_id=request.get("strategy_id", "unknown"),
@@ -583,10 +587,12 @@ class Optimizer:
                 )
             # 记录 best_params 更新事件
             if best_params is not None:
+                import uuid
+
                 conn.execute(
                     "INSERT INTO experiment_events (event_id, run_id, event_type, event_data, created_at) VALUES (?, ?, ?, ?, ?)",
                     (
-                        f"evt_{run_id}_best_{len(evaluations)}",
+                        f"evt_{run_id}_best_{len(evaluations)}_{uuid.uuid4().hex[:8]}",
                         run_id,
                         "BEST_UPDATE",
                         json.dumps({"best_params": best_params, "score": str(evaluations[-1].get("score", "")) if evaluations else ""}, default=str),

@@ -133,6 +133,25 @@ class TestRawWriter:
         files = writer.write_bars("btcusdt-perp", [])
         assert files == []
 
+    def test_write_bars_merge_default_keeps_existing_rows(self, tmp_path: Path) -> None:
+        """默认 merge 模式：已有分区合并去重而非覆盖（M3.4 M1 遗留回归）"""
+        raw_dir = tmp_path / "raw"
+        writer = RawWriter(raw_dir=raw_dir, source="binance")
+
+        bar1 = _make_bar(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC))
+        bar2 = _make_bar(datetime(2026, 1, 1, 0, 5, 0, tzinfo=UTC))
+
+        files1 = writer.write_bars("btcusdt-perp", [bar1])
+        assert len(files1) == 1
+
+        # 第二次默认（merge）写入：不同 bar 应合并，已有 bar 不应被覆盖丢失
+        files2 = writer.write_bars("btcusdt-perp", [bar2])
+        assert len(files2) == 1
+
+        import polars as pl
+        df = pl.read_parquet(files2[0])
+        assert df.height == 2, f"merge 后应保留 2 根 bar，实际 {df.height}"
+
     def test_write_funding_rates(self, tmp_path: Path) -> None:
         """资金费率落盘"""
         raw_dir = tmp_path / "raw"

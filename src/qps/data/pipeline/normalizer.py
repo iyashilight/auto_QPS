@@ -103,7 +103,7 @@ class RawWriter:
         symbol: str,
         bars: list[Bar],
         batch_id: str | None = None,
-        mode: str = "append",
+        mode: str = "merge",
     ) -> list[Path]:
         """写入 K 线数据到 Raw 层
 
@@ -114,7 +114,7 @@ class RawWriter:
             symbol: 交易所符号（如 btcusdt-perp）
             bars: K 线数据列表
             batch_id: 批次 ID（用于 data_version）
-            mode: 写入模式 - 'append'（追加，默认）、'overwrite'（覆盖）、'skip'（跳过已有）
+            mode: 写入模式 - 'merge'（合并去重，默认）、'overwrite'（覆盖）、'skip'（跳过已有）
 
         Returns:
             写入的文件路径列表
@@ -149,8 +149,8 @@ class RawWriter:
                 if mode == "skip":
                     logger.debug("Raw 分区已存在，跳过: %s", existing_file)
                     continue
-                elif mode == "append":
-                    # 追加模式：读取已有数据，合并后去重（按 interval + open_time）
+                elif mode in ("merge", "append"):
+                    # 合并/追加模式：读取已有数据，合并后去重（按 interval + open_time）
                     existing_df = pl.read_parquet(existing_file)
                     new_df = self._bars_to_dataframe(day_bars, data_version)
                     # 按 interval + open_time 去重，保留最新的

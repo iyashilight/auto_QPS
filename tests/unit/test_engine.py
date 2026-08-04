@@ -22,11 +22,13 @@ from qps.core.models.experiment import (
     BacktestRun,
     CostConfig,
     DataRange,
+    Metrics,
     OptimizationRun,
 )
-from qps.core.models.market import Bar
+from qps.core.models.market import Bar, FeatureSet
 from qps.infra.storage.meta_db import MetaDB
 from qps.research.backtest.event_driven import EventDrivenBacktestEngine
+from qps.research.backtest.vectorized import VectorizedBacktestEngine
 from qps.research.experiments import ExperimentStore
 from qps.research.optimizer.engine import Optimizer
 
@@ -95,6 +97,7 @@ def _build_container(
     bars: list[Bar] | None = None,
     funding_rates: list[Any] | None = None,
     mark_prices: list[Any] | None = None,
+    features: list[Any] | None = None,
     strategy_registry: Any | None = None,
 ) -> MagicMock:
     """构建 mock 容器（带真实 MetaDB + ExperimentStore + 可配置的 DataProvider）"""
@@ -116,6 +119,7 @@ def _build_container(
     dp.get_bars = AsyncMock(return_value=bars or [])
     dp.get_funding_rates = AsyncMock(return_value=funding_rates or [])
     dp.get_mark_prices = AsyncMock(return_value=mark_prices or [])
+    dp.get_features = AsyncMock(return_value=features or [])
 
     def get_port(name: str) -> Any:
         if name == "data_provider":
@@ -185,6 +189,53 @@ class TestDeterminism:
             assert result1.metrics.total_return == result2.metrics.total_return
             assert result1.metrics.sharpe == result2.metrics.sharpe
             assert result1.metrics.trade_count == result2.metrics.trade_count
+
+    @pytest.mark.asyncio()
+    async def test_realized_pnl_and_costs_reflected_in_equity(self) -> None:
+        """权益记账：平仓盈亏与费用/滑点必须进入权益（M3.4 P0-1 回归）"""
+        import json as json_lib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bars = [
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+                    open_price=Decimal("100"), close=Decimal("100"),
+                ),
+                # +10% → OPEN SHORT（在下一根 bar open 成交）
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+                    open_price=Decimal("100"), close=Decimal("110"),
+                ),
+                # -9% → CLOSE SHORT（在下一根 bar open 成交，盈利）
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 10, tzinfo=UTC),
+                    open_price=Decimal("110"), close=Decimal("100"),
+                ),
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 15, tzinfo=UTC),
+                    open_price=Decimal("100"), close=Decimal("100"),
+                ),
+            ]
+            container = _build_container(Path(tmpdir), bars=bars)
+            engine = EventDrivenBacktestEngine(container)
+            request = _make_backtest_request(params={"entry_z": 5.0, "position_size": "0.1"})
+            result = await engine.run(request)
+
+            assert result.status == ExperimentStatus.SUCCEEDED
+            assert result.metrics is not None
+            assert result.metrics.trade_count == 1
+            # 盈利平仓必须反映到权益：total_return > 0
+            assert result.metrics.total_return > Decimal("0"), \
+                f"盈利平仓后 total_return 应为正，实际 {result.metrics.total_return}"
+
+            # 逐字节核对权益曲线：最终权益 = 初始 + 平仓盈亏 - 全部费用/滑点
+            trades = [json_lib.loads(line) for line in Path(result.trades_ref).read_text(encoding="utf-8").splitlines()]
+            pnl = sum(Decimal(t["pnl"]) for t in trades)
+            costs = sum(Decimal(t["fee"]) + Decimal(t["slippage"]) for t in trades)
+            equity_points = [json_lib.loads(line) for line in Path(result.equity_curve_ref).read_text(encoding="utf-8").splitlines()]
+            final_equity = Decimal(equity_points[-1]["equity"])
+            assert final_equity == Decimal("10000") + pnl - costs, \
+                f"最终权益应=10000+盈亏-成本，实际 {final_equity}（pnl={pnl}, costs={costs}）"
 
     def test_run_id_unique_on_same_second(self) -> None:
         """同秒两次生成 run_id 不同（uuid4 保证）"""
@@ -278,6 +329,13 @@ class TestLiquidation:
             assert "fees" in result.metrics.cost_breakdown, "cost_breakdown 应含 fees"
             assert "slippage" in result.metrics.cost_breakdown, "cost_breakdown 应含 slippage"
             assert "funding" in result.metrics.cost_breakdown, "cost_breakdown 应含 funding"
+            # 资金变化正确：强平亏损必须反映到权益（M3.4 P0-1 回归）
+            assert result.metrics.total_return < Decimal("0"), \
+                f"强平大亏后 total_return 应为负，实际 {result.metrics.total_return}"
+            import json as json_lib
+            equity_points = [json_lib.loads(line) for line in Path(result.equity_curve_ref).read_text(encoding="utf-8").splitlines()]
+            assert Decimal(equity_points[-1]["equity"]) < Decimal("10000"), \
+                "强平亏损后最终权益应低于初始资金"
 
 
 # ── 资金费率端到端测试 ──────────────────────────────────
@@ -414,6 +472,56 @@ class TestFundingRate:
                 f"空头 + 正费率 → funding_pnl 应为负（收取/成本语义），实际 {result.metrics.funding_pnl}"
             # cost_breakdown 含 funding 分列
             assert "funding" in result.metrics.cost_breakdown, "cost_breakdown 应含 funding 分列"
+
+    @pytest.mark.asyncio()
+    async def test_funding_not_charged_before_position_open(self) -> None:
+        """费率归属：开仓前的历史费率不得结算给当前持仓（M3.4 P0-2 回归）"""
+        import json as json_lib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bars = [
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+                    open_price=Decimal("100"), close=Decimal("100"),
+                ),
+                # +10% → OPEN SHORT（00:10 成交）
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+                    open_price=Decimal("100"), close=Decimal("110"),
+                ),
+                # -9% → CLOSE SHORT（00:15 成交）
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 10, tzinfo=UTC),
+                    open_price=Decimal("110"), close=Decimal("100"),
+                ),
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 15, tzinfo=UTC),
+                    open_price=Decimal("100"), close=Decimal("100"),
+                ),
+            ]
+
+            class MockFundingRate:
+                def __init__(self, funding_ts: datetime, rate: Decimal):
+                    self.funding_ts = funding_ts
+                    self.rate = rate
+
+            # 两条费率都在持仓开仓（00:10）之前，不应结算
+            funding_rates = [
+                MockFundingRate(datetime(2026, 1, 1, 0, 0, tzinfo=UTC), Decimal("0.001")),
+                MockFundingRate(datetime(2026, 1, 1, 0, 5, tzinfo=UTC), Decimal("0.001")),
+            ]
+            container = _build_container(Path(tmpdir), bars=bars, funding_rates=funding_rates)
+            engine = EventDrivenBacktestEngine(container)
+            request = _make_backtest_request(params={"entry_z": 5.0, "position_size": "0.1"})
+            result = await engine.run(request)
+
+            assert result.status == ExperimentStatus.SUCCEEDED
+            assert result.metrics is not None
+            assert result.metrics.funding_pnl == Decimal("0"), \
+                f"开仓前的费率不应结算，funding_pnl 应为 0，实际 {result.metrics.funding_pnl}"
+            trades = [json_lib.loads(line) for line in Path(result.trades_ref).read_text(encoding="utf-8").splitlines()]
+            funding_trades = [t for t in trades if t["action"] == "FUNDING"]
+            assert len(funding_trades) == 0, f"不应有 FUNDING 交易，实际 {len(funding_trades)}"
 
 
 # ── 未来函数验收测试（ADR-009：排序语义） ────────────────
@@ -653,6 +761,77 @@ class TestStrategyExecution:
             assert result.engine_config["signal_source"] == "strategy", \
                 f"策略成功路径应返回 strategy，实际 {result.engine_config['signal_source']}"
 
+    @pytest.mark.asyncio()
+    async def test_demo_strategy_trades_when_features_injected(self) -> None:
+        """特征注入：demo 策略在回测中获得 FeaturePipeline 数据后真实交易（M3.4 P0-5 回归）"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 40)
+
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            strategies_dir = Path(tmpdir) / "strategies"
+            strategies_dir.mkdir(parents=True)
+            (strategies_dir / "demo_mean_reversion").mkdir()
+
+            real_strategy = Path("/home/yagami/autoQps/strategies/demo_mean_reversion/strategy.py")
+            if real_strategy.exists():
+                import shutil
+                shutil.copy2(real_strategy, strategies_dir / "demo_mean_reversion" / "strategy.py")
+            else:
+                pytest.skip("demo 策略文件不存在")
+
+            # 为每根 bar 注入特征（returns 显著 → 触发开仓）
+            features: list[FeatureSet] = []
+            for bar in bars:
+                features.append(FeatureSet(
+                    instrument_id=bar.instrument_id,
+                    ts=bar.open_time,
+                    feature_name="returns",
+                    value=Decimal("0.01"),
+                    feature_version="feat-test",
+                    data_version="v1",
+                ))
+                features.append(FeatureSet(
+                    instrument_id=bar.instrument_id,
+                    ts=bar.open_time,
+                    feature_name="mean_return_20",
+                    value=Decimal("0.001"),
+                    feature_version="feat-test",
+                    data_version="v1",
+                ))
+                features.append(FeatureSet(
+                    instrument_id=bar.instrument_id,
+                    ts=bar.open_time,
+                    feature_name="realized_vol_20",
+                    value=Decimal("0.2"),
+                    feature_version="feat-test",
+                    data_version="v1",
+                ))
+
+            mock_registry = AsyncMock()
+            mock_version = MagicMock()
+            mock_version.code_ref = "local:demo_mean_reversion"
+            mock_version.runtime_constraints = {"allow_imports": []}
+            mock_version.feature_dependencies = ["returns", "mean_return_20", "realized_vol_20"]
+            mock_registry.get_version = AsyncMock(return_value=mock_version)
+
+            container = _build_container(
+                data_dir, bars=bars, features=features, strategy_registry=mock_registry,
+            )
+            engine = EventDrivenBacktestEngine(container)
+            request = _make_backtest_request(params={"entry_z": 2.0, "position_size": "0.1"})
+            result = await engine.run(request)
+
+            assert result.status == ExperimentStatus.SUCCEEDED
+            assert result.engine_config["signal_source"] == "strategy"
+            assert result.metrics is not None
+            # trade_count 只统计 CLOSE；demo 开仓后未触发平仓条件，断言至少有一次 OPEN 成交
+            import json as json_lib
+            trades = [json_lib.loads(line) for line in Path(result.trades_ref).read_text(encoding="utf-8").splitlines()]  # type: ignore[arg-type]
+            open_trades = [t for t in trades if t["action"] == "OPEN"]
+            assert len(open_trades) > 0, \
+                f"注入特征后 demo 策略应产生开仓成交，实际 trades={trades}"
+
 
 # ── 实验存储 + rerun 端到端测试 ─────────────────────────
 
@@ -736,6 +915,118 @@ class TestRerun:
             equity2_hash = hashlib.sha256(equity2_content).hexdigest()
             assert equity1_hash == equity2_hash, \
                 f"equity 文件 hash 不一致: {equity1_hash[:16]} vs {equity2_hash[:16]}"
+
+    @pytest.mark.asyncio()
+    async def test_vectorized_rerun_unique_run_id(self) -> None:
+        """向量化引擎同秒 rerun：run_id 必须唯一且成功（M3.4 P1-1 回归）"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 30)
+            container = _build_container(Path(tmpdir), bars=bars)
+            engine = VectorizedBacktestEngine(container)
+            request = _make_backtest_request(params={"entry_z": 0.1, "position_size": "0.1"})
+
+            r1 = await engine.run(request)
+            r2 = await engine.run(request)
+            assert r1.status == ExperimentStatus.SUCCEEDED
+            assert r2.status == ExperimentStatus.SUCCEEDED, \
+                f"同秒第二次运行应成功，实际 {r2.status} {r2.engine_config}"
+            assert r1.run_id != r2.run_id, "同秒两次运行 run_id 必须不同"
+
+            r3 = await engine.rerun(r1.run_id)
+            assert r3.status == ExperimentStatus.SUCCEEDED, \
+                f"向量化 rerun 应成功，实际 {r3.status} {r3.engine_config}"
+            assert r3.run_id != r1.run_id
+
+    @pytest.mark.asyncio()
+    async def test_get_run_restores_metrics_and_refs(self) -> None:
+        """get_run 必须恢复 metrics/trades_ref/equity_curve_ref（M3.4 P1-2 回归）"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 30)
+            container = _build_container(Path(tmpdir), bars=bars)
+            engine = EventDrivenBacktestEngine(container)
+            request = _make_backtest_request(params={"entry_z": 0.1, "position_size": "0.1"})
+            result = await engine.run(request)
+            assert result.status == ExperimentStatus.SUCCEEDED
+
+            store = container.get_port("experiment_store")
+            restored = await store.get_run(result.run_id)
+            assert isinstance(restored, BacktestRun)
+            assert restored.metrics is not None, "get_run 应恢复 metrics"
+            assert restored.metrics.total_return == result.metrics.total_return
+            assert restored.trades_ref == result.trades_ref, "get_run 应恢复 trades_ref"
+            assert restored.equity_curve_ref == result.equity_curve_ref, "get_run 应恢复 equity_curve_ref"
+
+
+# ── 优化器全链路 ─────────────────────────────────────────
+
+
+class TestOptimizerSearch:
+    """优化器搜索全链路（含 budget%10==0 边界）"""
+
+    @pytest.mark.asyncio()
+    async def test_search_completes_with_budget_multiple_of_10(self) -> None:
+        """budget=10（%10==0）：搜索必须正常完成且 DB status=SUCCEEDED（M3.4 P0-3 回归）"""
+        import uuid
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = MetaDB(Path(tmpdir) / "meta.db")
+            db.initialize()
+            db.setup_insert_only_constraints()
+            store = ExperimentStore(meta_db=db, data_dir=Path(tmpdir))
+            container = MagicMock()
+            container.config = MagicMock()
+            container.config.data_dir = Path(tmpdir)
+
+            engine = EventDrivenBacktestEngine(container)
+
+            async def run(req):
+                metrics = Metrics(
+                    total_return=Decimal("0.1"), annualized_return=Decimal("0.2"),
+                    max_drawdown=Decimal("0.1"), sharpe=Decimal("1.5"), win_rate=Decimal("0.6"),
+                    volatility=Decimal("0.2"), trade_count=10, profit_factor=Decimal("2"),
+                )
+                return BacktestRun(
+                    run_id=f"bt_mock_{uuid.uuid4().hex[:8]}", strategy_id="s", version_no=1,
+                    params={}, data_range=DataRange(
+                        start=datetime(2026, 1, 1, tzinfo=UTC), end=datetime(2026, 2, 1, tzinfo=UTC),
+                    ),
+                    data_version="v1", feature_version="v1", engine_config={},
+                    metrics=metrics, status=ExperimentStatus.SUCCEEDED,
+                    created_at=datetime.now(UTC),
+                )
+            engine.run = run  # type: ignore[method-assign]
+
+            def get_port(name: str) -> Any:
+                if name == "experiment_store":
+                    return store
+                if name == "backtest_engine":
+                    return engine
+                raise KeyError(name)
+
+            container.get_port = MagicMock(side_effect=get_port)
+
+            optimizer = Optimizer(container)
+            request = {
+                "strategy_id": "s", "version_no": 1,
+                "search_space": {"entry_z": {"low": 1.0, "high": 2.0, "step": 0.1}},
+                "objective": {"name": "sharpe"},
+                "algorithm": "GRID", "budget": 10, "random_seed": 42,
+                "instruments": ["binance-btc-usdt-perp"], "interval": "5m",
+                "start": "2026-01-01T00:00:00+00:00", "end": "2026-07-01T00:00:00+00:00",
+                "data_version": "v1", "feature_version": "v1",
+            }
+            result = await optimizer.search(request)
+
+            assert result.status == ExperimentStatus.SUCCEEDED, \
+                f"搜索应完成，实际 {result.status}"
+            assert result.best_params is not None
+            assert len(result.evaluations) == 10
+            with db.connect() as conn:
+                status_row = conn.execute(
+                    "SELECT status FROM experiments WHERE run_id = ?", (result.run_id,),
+                ).fetchone()
+                assert status_row["status"] == "SUCCEEDED", \
+                    f"DB status 应为 SUCCEEDED，实际 {status_row['status']}"
 
     def test_get_run_preserves_data_range(self) -> None:
         """get_run 从 start_ts/end_ts 恢复 data_range"""

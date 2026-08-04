@@ -24,7 +24,7 @@
 
 9. **写库失败不静默**：引擎/优化器写库失败直接抛错（不吞掉 except Exception），R4/R5 红线保证数据可追溯。
 
-10. **AlphaScore evaluated_at 注入**：compute_alpha_score 新增 evaluated_at 参数，测试中注入固定 clock 保证确定性。
+10. **AlphaScore evaluated_at 注入**：compute_alpha_score 新增 evaluated_at 参数；M3.4 起生产路径锚定请求结束时间（`req.end`）作为固定 clock，保证同一请求（含 rerun）报告卡逐位一致，测试可另行注入。
 
 ## 新增表
 

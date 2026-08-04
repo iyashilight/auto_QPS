@@ -18,6 +18,7 @@ from qps.core.models.experiment import (
     BacktestRun,
     ComparisonReport,
     DataRange,
+    Metrics,
     OptimizationRun,
     ReportCard,
     RunSummary,
@@ -121,6 +122,21 @@ class ExperimentStore:
         )
 
         if run_type == "BACKTEST":
+            # 从 report_cards 恢复 metrics（BacktestRun.metrics）
+            metrics = None
+            with self._meta_db.connect() as conn:
+                card_row = conn.execute(
+                    "SELECT metrics FROM report_cards WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+            if card_row is not None and card_row["metrics"]:
+                try:
+                    metrics = Metrics.model_validate(json.loads(card_row["metrics"]))
+                except Exception:
+                    logger.exception("恢复 metrics 失败: %s", run_id)
+            # trades_ref/equity_curve_ref 从 engine_config 恢复
+            trades_ref = engine_config.get("trades_ref")
+            equity_curve_ref = engine_config.get("equity_curve_ref")
             return BacktestRun(
                 run_id=row["run_id"],
                 strategy_id=row["strategy_id"],
@@ -131,6 +147,9 @@ class ExperimentStore:
                 feature_version=row["feature_version"],
                 engine_config=engine_config,
                 environment_lock=row["environment_lock"],
+                trades_ref=trades_ref,
+                equity_curve_ref=equity_curve_ref,
+                metrics=metrics,
                 status=ExperimentStatus(row["status"]),
                 created_at=created_at,
             )
@@ -139,7 +158,7 @@ class ExperimentStore:
         # 从 experiment_events 读取增量 evaluations
         with self._meta_db.connect() as conn:
             event_rows = conn.execute(
-                "SELECT event_data FROM experiment_events WHERE run_id = ? AND event_type = 'EVALUATION' ORDER BY created_at",
+                "SELECT event_data FROM experiment_events WHERE run_id = ? AND event_type = 'EVALUATION' ORDER BY created_at, rowid",
                 (run_id,),
             ).fetchall()
         evaluations = [json.loads(r["event_data"]) for r in event_rows] if event_rows else params.get("evaluations", [])

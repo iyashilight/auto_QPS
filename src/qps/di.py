@@ -183,6 +183,7 @@ def build_container(config: Config) -> Container:
     from qps.research.backtest.event_driven import EventDrivenBacktestEngine
     from qps.research.experiments import ExperimentStore
     from qps.research.optimizer.engine import Optimizer
+    from qps.research.registry import StrategyRegistry
 
     backtest_engine = EventDrivenBacktestEngine(container)
     container.register_port("backtest_engine", backtest_engine)
@@ -196,9 +197,12 @@ def build_container(config: Config) -> Container:
     optimizer = Optimizer(container)
     container.register_port("optimizer", optimizer)
 
+    # M3.4: 接线策略注册表（回测引擎按 strategy_id+version_no 加载真实策略代码）
+    strategy_registry = StrategyRegistry(config.data_dir / "meta.db")
+    container.register_port("strategy_registry", strategy_registry)
+
     _port_names = [
         "broker_adapter",
-        "strategy_registry",
         "lifecycle_manager",
         "signal_engine",
         "portfolio_manager",

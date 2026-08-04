@@ -80,6 +80,7 @@ def _build_cli_container(tmp_path: Path, bars: list[Bar] | None = None) -> Magic
     mock_dp.get_bars = AsyncMock(return_value=bars or [])
     mock_dp.get_funding_rates = AsyncMock(return_value=[])
     mock_dp.get_mark_prices = AsyncMock(return_value=[])
+    mock_dp.get_features = AsyncMock(return_value=[])
 
     mock_container = MagicMock()
     mock_container.config = MagicMock()
@@ -289,3 +290,69 @@ class TestCLIOptimize:
             "research", "optimize", "test_strat",
         ])
         assert result.exit_code == 2, f"无 search_space 应返回退出码 2，实际 {result.exit_code}"
+
+    def test_optimize_success(self, tmp_path: Path) -> None:
+        """qps research optimize 成功路径：budget=10（%10==0 边界）全链路完成（M3.4 P0-3 回归）"""
+        import uuid as uuid_lib
+
+        from qps.core.constants import ExperimentStatus as ExpStatus
+        from qps.core.models.experiment import BacktestRun, DataRange, Metrics
+        from qps.infra.storage.meta_db import MetaDB
+        from qps.research.backtest.event_driven import EventDrivenBacktestEngine
+        from qps.research.experiments import ExperimentStore
+
+        db = MetaDB(tmp_path / "meta.db")
+        db.initialize()
+        db.setup_insert_only_constraints()
+        store = ExperimentStore(meta_db=db, data_dir=tmp_path)
+
+        container = MagicMock()
+        container.config = MagicMock()
+        container.config.data_dir = tmp_path
+
+        engine = EventDrivenBacktestEngine(container)
+
+        async def run(req):
+            metrics = Metrics(
+                total_return=Decimal("0.1"), annualized_return=Decimal("0.2"),
+                max_drawdown=Decimal("0.1"), sharpe=Decimal("1.5"), win_rate=Decimal("0.6"),
+                volatility=Decimal("0.2"), trade_count=10, profit_factor=Decimal("2"),
+            )
+            return BacktestRun(
+                run_id=f"bt_mock_{uuid_lib.uuid4().hex[:8]}", strategy_id="s", version_no=1,
+                params={}, data_range=DataRange(
+                    start=datetime(2026, 1, 1, tzinfo=UTC), end=datetime(2026, 2, 1, tzinfo=UTC),
+                ),
+                data_version="v1", feature_version="v1", engine_config={},
+                metrics=metrics, status=ExpStatus.SUCCEEDED,
+                created_at=datetime.now(UTC),
+            )
+        engine.run = run  # type: ignore[method-assign]
+
+        def get_port(name: str) -> object:
+            if name == "experiment_store":
+                return store
+            if name == "backtest_engine":
+                return engine
+            raise KeyError(name)
+
+        container.get_port = MagicMock(side_effect=get_port)
+
+        with patch("qps.di.build_container", return_value=container):
+            result = runner.invoke(app, [
+                "research", "optimize", "test_strat",
+                "--algorithm", "grid",
+                "--budget", "10",
+                "--search-space", '{"entry_z": {"low": 1.0, "high": 2.0, "step": 0.1}}',
+                "--range", "2026-01-01:2026-07-01",
+                "--seed", "42",
+            ])
+
+        assert result.exit_code == 0, f"optimize 应成功: {result.output}\n{result.exception}"
+        assert "优化完成" in result.output
+        # DB 最终 status = SUCCEEDED
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT status FROM experiments WHERE run_type='OPTIMIZATION'",
+            ).fetchall()
+        assert rows and rows[-1]["status"] == "SUCCEEDED", f"DB status 应为 SUCCEEDED，实际 {rows}"

@@ -75,8 +75,9 @@ class VectorizedBacktestEngine:
         try:
             result = await self._execute_backtest(req, run_id)
             return result
-        except BacktestError:
-            raise
+        except BacktestError as e:
+            # 端口契约：失败必须返回 FAILED 记录而非抛异常
+            return self._failed_run(run_id, str(e), req)
         except Exception as e:
             logger.exception("向量化回测执行失败: %s", run_id)
             return self._failed_run(run_id, str(e), request)
@@ -190,7 +191,8 @@ class VectorizedBacktestEngine:
 
             # 更新权益曲线
             unrealized = self._compute_unrealized_pnl(positions, bar, instrument_id)
-            equity = cash + unrealized
+            locked_margin = sum(p.margin for p in positions.values())
+            equity = cash + locked_margin + unrealized
             equity_curve.append(EquityPoint(
                 timestamp=bar.open_time,
                 equity=equity,
@@ -217,7 +219,7 @@ class VectorizedBacktestEngine:
         # AlphaScore 注入固定 clock（确定性）
         alpha_score = compute_alpha_score(
             run_id, req.strategy_id, req.version_no, metrics,
-            evaluated_at=datetime.now(UTC),
+            evaluated_at=req.end,
         )
         report_card = ReportCard(
             run_id=report_card.run_id,
@@ -250,6 +252,8 @@ class VectorizedBacktestEngine:
             "cost_config": req.cost_config.model_dump(),
             "leverage": str(req.leverage),
             "random_seed": req.random_seed,
+            "trades_ref": str(trades_ref),
+            "equity_curve_ref": str(equity_ref),
         }
 
         result = BacktestRun(
@@ -438,11 +442,14 @@ class VectorizedBacktestEngine:
 
     @staticmethod
     def _generate_run_id(req: BacktestRequest) -> str:
-        """生成确定性 run_id（含请求内容 hash 确保唯一性）"""
+        """生成确定性 run_id（含请求内容 hash + uuid4 确保唯一性）"""
+        import uuid
+
         content = f"v:{req.strategy_id}:{','.join(req.instruments)}:{req.start.isoformat()}:{req.end.isoformat()}:{req.random_seed}"
         content_hex = hashlib.sha256(content.encode()).hexdigest()[:8]
         ts = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        return f"{BACKTEST_RUN_ID_PREFIX}v_{ts}_{content_hex}"
+        uid = uuid.uuid4().hex[:4]
+        return f"{BACKTEST_RUN_ID_PREFIX}v_{ts}_{content_hex}_{uid}"
 
     def _compute_env_lock(self) -> str:
         """计算环境锁（uv.lock hash，基于仓库根解析）"""
