@@ -124,9 +124,9 @@ class MetaDB:
         """)
 
     def setup_insert_only_constraints(self) -> None:
-        """设置 insert-only 约束（对 experiments, audit_log）"""
+        """设置 insert-only 约束（对 experiments, experiment_events, audit_log）"""
         with self.connect() as conn:
-            for table in ("experiments", "audit_log"):
+            for table in ("experiments", "experiment_events", "audit_log"):
                 self.enforce_insert_only(table, conn)
             conn.commit()
 

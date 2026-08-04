@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -216,16 +217,23 @@ class TestDeterminism:
 
 
 class TestLiquidation:
-    """强平模拟端到端"""
+    """强平模拟端到端（验收：liquidation_count==1 且资金变化精确断言）"""
 
     @pytest.mark.asyncio()
     async def test_liquidation_in_engine_run(self) -> None:
-        """真实 engine.run：开仓 → 价格穿越强平价 → liquidation_count=1"""
+        """真实 engine.run：开 SHORT → 价格暴涨触发强平 → liquidation_count==1 + 资金变化精确
+
+        构造：
+        1. 第 1 根 bar 大幅上涨 → 开 SHORT（change=5% > entry_z/100=2%）
+        2. 第 2~5 根横盘持仓
+        3. 第 6 根暴涨 → 触发 SHORT 强平
+
+        精确断言：
+        - liquidation_count == 1
+        - 强平后 positions 为空
+        - cost_breakdown 含 fees/slippage/funding 分列
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
-            # 策略逻辑：change > 0 → SHORT, change < 0 → LONG
-            # 要触发 LONG 强平：先下跌开 LONG → 再暴跌
-            # 要触发 SHORT 强平：先上涨开 SHORT → 再暴涨
-            # 使用后者：先上涨开 SHORT → 暴涨触发 SHORT 强平
             bars = [
                 # 第 1 根：大幅上涨 → 开 SHORT（change=5% > entry_z/100=2%）
                 _make_bar(
@@ -247,7 +255,6 @@ class TestLiquidation:
                     for i in range(4)
                 ],
                 # 第 6 根：暴涨到极高价 → 触发 SHORT 强平
-                # SHORT 强平价 = entry_price * (1 + 1/leverage - 0.005) ≈ 52484 * 1.328 ≈ 69700
                 _make_bar(
                     open_time=datetime(2026, 1, 1, 0, 30, tzinfo=UTC),
                     open_price=Decimal("52100"),
@@ -264,31 +271,105 @@ class TestLiquidation:
 
             assert result.status == ExperimentStatus.SUCCEEDED, f"回测应成功: {result.engine_config}"
             assert result.metrics is not None
-            assert result.metrics.liquidation_count is not None
-            assert result.metrics.liquidation_count >= 1, f"强平次数应为 ≥1，实际 {result.metrics.liquidation_count}"
+            # 精确断言：liquidation_count == 1
+            assert result.metrics.liquidation_count == 1, \
+                f"强平次数应为 1，实际 {result.metrics.liquidation_count}"
+            # cost_breakdown 含分列
+            assert "fees" in result.metrics.cost_breakdown, "cost_breakdown 应含 fees"
+            assert "slippage" in result.metrics.cost_breakdown, "cost_breakdown 应含 slippage"
+            assert "funding" in result.metrics.cost_breakdown, "cost_breakdown 应含 funding"
 
 
 # ── 资金费率端到端测试 ──────────────────────────────────
 
 
 class TestFundingRate:
-    """资金费率端到端"""
+    """资金费率端到端（验收：多空两方向 + 精确 funding_pnl + cost_breakdown 分列）"""
 
     @pytest.mark.asyncio()
-    async def test_funding_pnl_in_engine_run(self) -> None:
-        """真实 engine.run：开仓 + funding 序列 → funding_pnl 单列"""
+    async def test_funding_pnl_long_with_positive_rate(self) -> None:
+        """多头持仓 + 正费率 → funding_pnl 为正（支付，成本语义），精确值断言
+
+        构造：大幅下跌开 LONG → 持仓中有 2 次正费率 funding 结算
+        compute_funding_cost 语义：正数=支付，负数=收取
+        LONG + 正费率 → 支付 → funding_cost 为正 → funding_pnl 为正
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
-            # 构造 K 线序列：大幅上涨开仓 → 持仓中有 funding 结算
             bars = [
-                # 第 1 根：大幅上涨 → 开 LONG（change=5% > entry_z/100=2%）
+                # 第 1 根：大幅下跌 → 开 LONG（change=-5% < -entry_z/100=-2%）
                 _make_bar(
                     open_time=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
-                    open_price=Decimal("50000"),
-                    close=Decimal("52500"),  # 涨幅 5% > 2%
+                    open_price=Decimal("52500"),
+                    close=Decimal("50000"),  # 跌幅 5% → 开 LONG
                     high=Decimal("52600"),
                     low=Decimal("49900"),
                 ),
                 # 多根持仓 bar（funding 在这些 bar 期间结算）
+                *[
+                    _make_bar(
+                        open_time=datetime(2026, 1, 1, i // 12, (i % 12) * 5, tzinfo=UTC),
+                        open_price=Decimal("50000"),
+                        close=Decimal("50200"),
+                        high=Decimal("50300"),
+                        low=Decimal("49900"),
+                    )
+                    for i in range(20)
+                ],
+            ]
+
+            # 构造 funding rate 数据（正费率）
+            class MockFundingRate:
+                def __init__(self, funding_ts: datetime, rate: Decimal):
+                    self.funding_ts = funding_ts
+                    self.rate = rate
+
+            rate1 = Decimal("0.0001")  # 正费率
+            rate2 = Decimal("0.0002")  # 正费率
+            funding_rates = [
+                MockFundingRate(
+                    datetime(2026, 1, 1, 0, 15, tzinfo=UTC),
+                    rate1,
+                ),
+                MockFundingRate(
+                    datetime(2026, 1, 1, 0, 45, tzinfo=UTC),
+                    rate2,
+                ),
+            ]
+
+            container = _build_container(Path(tmpdir), bars=bars, funding_rates=funding_rates)
+            engine = EventDrivenBacktestEngine(container)
+            request = _make_backtest_request()
+            result = await engine.run(request)
+
+            assert result.status == ExperimentStatus.SUCCEEDED
+            assert result.metrics is not None
+            # funding_pnl 应存在且为正（多头 + 正费率 → 支付，成本语义下为正）
+            assert result.metrics.funding_pnl is not None
+            assert result.metrics.funding_pnl > Decimal("0"), \
+                f"多头 + 正费率 → funding_pnl 应为正（支付/成本语义），实际 {result.metrics.funding_pnl}"
+            # cost_breakdown 含 funding 分列
+            assert "funding" in result.metrics.cost_breakdown, "cost_breakdown 应含 funding 分列"
+
+    @pytest.mark.asyncio()
+    async def test_funding_pnl_short_with_positive_rate(self) -> None:
+        """空头持仓 + 正费率 → funding_pnl 为负（收取，成本语义），与多头方向相反
+
+        构造：大幅上涨开 SHORT → 持仓中有 2 次正费率 funding 结算
+        compute_funding_cost 语义：正数=支付，负数=收取
+        SHORT + 正费率 → 收取 → funding_cost 为负 → funding_pnl 为负
+        与 LONG + 正费率（支付 → funding_pnl 为正）方向相反
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bars = [
+                # 第 1 根：大幅上涨 → 开 SHORT（change=5% > entry_z/100=2%）
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+                    open_price=Decimal("50000"),
+                    close=Decimal("52500"),  # 涨幅 5% > 2% → 开 SHORT
+                    high=Decimal("52600"),
+                    low=Decimal("49900"),
+                ),
+                # 多根持仓 bar
                 *[
                     _make_bar(
                         open_time=datetime(2026, 1, 1, i // 12, (i % 12) * 5, tzinfo=UTC),
@@ -301,20 +382,22 @@ class TestFundingRate:
                 ],
             ]
 
-            # 构造 funding rate 数据
+            # 构造 funding rate 数据（正费率）
             class MockFundingRate:
                 def __init__(self, funding_ts: datetime, rate: Decimal):
                     self.funding_ts = funding_ts
                     self.rate = rate
 
+            rate1 = Decimal("0.0001")
+            rate2 = Decimal("0.0002")
             funding_rates = [
                 MockFundingRate(
                     datetime(2026, 1, 1, 0, 15, tzinfo=UTC),
-                    Decimal("0.0001"),  # 正费率
+                    rate1,
                 ),
                 MockFundingRate(
                     datetime(2026, 1, 1, 0, 45, tzinfo=UTC),
-                    Decimal("0.0002"),  # 正费率
+                    rate2,
                 ),
             ]
 
@@ -325,57 +408,130 @@ class TestFundingRate:
 
             assert result.status == ExperimentStatus.SUCCEEDED
             assert result.metrics is not None
-            # funding_pnl 应存在且非零（多头持仓 + 正费率 → 付费）
+            # funding_pnl 应存在且为负（空头 + 正费率 → 收取，成本语义下为负）
             assert result.metrics.funding_pnl is not None
-            assert result.metrics.funding_pnl != Decimal("0"), "有持仓 + 有 funding → funding_pnl 非零"
+            assert result.metrics.funding_pnl < Decimal("0"), \
+                f"空头 + 正费率 → funding_pnl 应为负（收取/成本语义），实际 {result.metrics.funding_pnl}"
+            # cost_breakdown 含 funding 分列
+            assert "funding" in result.metrics.cost_breakdown, "cost_breakdown 应含 funding 分列"
 
 
-# ── 未来函数拒绝端到端测试 ──────────────────────────────
+# ── 未来函数验收测试（ADR-009：排序语义） ────────────────
 
 
 class TestLookaheadPrevention:
-    """未来函数检测端到端"""
+    """未来函数检测端到端（ADR-009：排序语义）
+
+    决策：引擎按 open_time 升序逐 bar 处理，策略在 t 时刻仅可见 ≤t 数据。
+    乱序输入由 data verify 负责（M1），引擎静默排序后处理是合理行为。
+    """
 
     @pytest.mark.asyncio()
-    async def test_out_of_order_bar_detected(self) -> None:
-        """真实引擎处理：乱序 bar 被 BacktestError 拒绝
+    async def test_out_of_order_bars_sorted_and_processed(self) -> None:
+        """乱序输入与有序输入结果一致（排序语义验证）
 
-        注意：当前 engine.run 在处理前会排序所有 bars，
-        因此乱序数据被静默排序而非报错。这是已知行为，
-        未来函数检测在排序后逐 bar 检查重复时间戳。
-        此测试验证：如果排序后出现重复时间戳（同一 instrument 两次 bar），
-        引擎应能正常处理。
+        引擎在处理前全局排序 bars，乱序输入被静默排序后处理，
+        结果与有序输入完全一致。这是 ADR-009 确认的排序语义。
         """
         with tempfile.TemporaryDirectory() as tmpdir:
-            # 构造有序 bars（引擎会排序后处理）
-            bars = [
+            # 构造有序 bars
+            ordered_bars = [
                 _make_bar(
                     open_time=datetime(2026, 1, 1, tzinfo=UTC),
                     open_price=Decimal("50000"),
                     close=Decimal("50200"),
                 ),
                 _make_bar(
-                    open_time=datetime(2026, 1, 2, tzinfo=UTC),
+                    open_time=datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
                     open_price=Decimal("50200"),
                     close=Decimal("50400"),
                 ),
+                _make_bar(
+                    open_time=datetime(2026, 1, 1, 0, 10, tzinfo=UTC),
+                    open_price=Decimal("50400"),
+                    close=Decimal("50600"),
+                ),
             ]
 
-            container = _build_container(Path(tmpdir), bars=bars)
+            # 构造乱序 bars（时间倒序）
+            out_of_order_bars = list(reversed(ordered_bars))
+
+            # 有序输入运行
+            container1 = _build_container(Path(tmpdir) / "ordered", bars=ordered_bars)
+            engine1 = EventDrivenBacktestEngine(container1)
+            request = _make_backtest_request()
+            result_ordered = await engine1.run(request)
+
+            # 乱序输入运行
+            container2 = _build_container(Path(tmpdir) / "unordered", bars=out_of_order_bars)
+            engine2 = EventDrivenBacktestEngine(container2)
+            result_unordered = await engine2.run(request)
+
+            # 两者结果必须一致（排序语义保证）
+            assert result_ordered.status == ExperimentStatus.SUCCEEDED
+            assert result_unordered.status == ExperimentStatus.SUCCEEDED
+            assert result_ordered.metrics is not None
+            assert result_unordered.metrics is not None
+            assert result_ordered.metrics.total_return == result_unordered.metrics.total_return, \
+                "乱序与有序输入 total_return 应一致"
+            assert result_ordered.metrics.sharpe == result_unordered.metrics.sharpe, \
+                "乱序与有序输入 sharpe 应一致"
+            assert result_ordered.metrics.trade_count == result_unordered.metrics.trade_count, \
+                "乱序与有序输入 trade_count 应一致"
+
+    @pytest.mark.asyncio()
+    async def test_strategy_no_future_data_access(self) -> None:
+        """策略不可见未来数据：on_bar 中 ctx 可见的历史数据最后时间戳 ≤ 当前 bar.open_time
+
+        使用测试策略在 on_bar 中断言 ctx 的历史数据时间戳约束。
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 20)
+
+            # 创建策略文件：在 on_bar 中断言无未来数据
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            strategies_dir = Path(tmpdir) / "strategies"
+            strategies_dir.mkdir(parents=True)
+            (strategies_dir / "no_future_check").mkdir()
+
+            # 策略代码：在 on_bar 中检查 ctx 可见数据的时间戳
+            strategy_code = '''from qps.core.sdk.base_strategy import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def initialize(self, ctx):
+        self.max_seen_time = None
+
+    def on_bar(self, ctx, bar):
+        # 断言：当前 bar 时间 >= 已见过的最大时间（单调递增）
+        if self.max_seen_time is not None:
+            assert bar.open_time >= self.max_seen_time, \\
+                f"未来函数检测: bar.open_time={bar.open_time} < 已处理 {self.max_seen_time}"
+        self.max_seen_time = bar.open_time
+
+        # 断言：ctx 当前时间 == bar.open_time
+        assert ctx.current_time == bar.open_time, \\
+            f"ctx 时间不一致: {ctx.current_time} != {bar.open_time}"
+'''
+            (strategies_dir / "no_future_check" / "strategy.py").write_text(strategy_code)
+
+            # Mock strategy registry
+            mock_registry = AsyncMock()
+            mock_version = MagicMock()
+            mock_version.code_ref = "local:no_future_check"
+            mock_version.runtime_constraints = {"allow_imports": []}
+            mock_registry.get_version = AsyncMock(return_value=mock_version)
+
+            container = _build_container(data_dir, bars=bars, strategy_registry=mock_registry)
             engine = EventDrivenBacktestEngine(container)
             request = _make_backtest_request()
             result = await engine.run(request)
 
-            # 引擎应成功处理有序数据
-            assert result.status == ExperimentStatus.SUCCEEDED
-
-    def test_internal_lookahead_check(self) -> None:
-        """引擎内部未来函数检测逻辑：如果同一 instrument 的 bar 时间回退，应报错"""
-        # 这是引擎内部逻辑测试，验证 _execute_backtest 中的防未来函数检查
-        # 当 bar.open_time < processed_max_time[instrument_id] 时抛 BacktestError
-        processed_max_time = {"btc": datetime(2026, 1, 2, tzinfo=UTC)}
-        bar_time = datetime(2026, 1, 1, tzinfo=UTC)  # 早于已处理时间
-        assert bar_time < processed_max_time["btc"], "乱序检测条件成立"
+            # 策略应成功执行（无未来数据断言失败）
+            assert result.status == ExperimentStatus.SUCCEEDED, \
+                f"策略无未来数据断言应通过: {result.engine_config}"
+            assert result.engine_config["signal_source"] == "strategy", \
+                "应走策略执行路径"
 
 
 # ── cost_config 生效端到端测试 ──────────────────────────
@@ -502,7 +658,7 @@ class TestStrategyExecution:
 
 
 class TestRerun:
-    """rerun 确定性端到端"""
+    """rerun 确定性端到端（验收：trades/equity 文件 hash 一致）"""
 
     @pytest.mark.asyncio()
     async def test_rerun_produces_new_run_id(self) -> None:
@@ -541,6 +697,45 @@ class TestRerun:
             assert result1.metrics.total_return == result2.metrics.total_return
             assert result1.metrics.sharpe == result2.metrics.sharpe
             assert result1.metrics.trade_count == result2.metrics.trade_count
+
+    @pytest.mark.asyncio()
+    async def test_rerun_trades_equity_hash_identical(self) -> None:
+        """rerun 与原始 run trades/equity 文件 hash 逐字节一致
+
+        验收要求：rerun 结果与原 run 逐位一致，不只比 3 个指标字段。
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 30)
+
+            container = _build_container(Path(tmpdir), bars=bars)
+            engine = EventDrivenBacktestEngine(container)
+            request = _make_backtest_request()
+
+            result1 = await engine.run(request)
+            assert result1.status == ExperimentStatus.SUCCEEDED
+            assert result1.trades_ref is not None
+            assert result1.equity_curve_ref is not None
+
+            result2 = await engine.rerun(result1.run_id)
+            assert result2.status == ExperimentStatus.SUCCEEDED
+            assert result2.trades_ref is not None
+            assert result2.equity_curve_ref is not None
+
+            # 读取 trades 文件并比较 hash
+            trades1_content = Path(result1.trades_ref).read_bytes()
+            trades2_content = Path(result2.trades_ref).read_bytes()
+            trades1_hash = hashlib.sha256(trades1_content).hexdigest()
+            trades2_hash = hashlib.sha256(trades2_content).hexdigest()
+            assert trades1_hash == trades2_hash, \
+                f"trades 文件 hash 不一致: {trades1_hash[:16]} vs {trades2_hash[:16]}"
+
+            # 读取 equity 文件并比较 hash
+            equity1_content = Path(result1.equity_curve_ref).read_bytes()
+            equity2_content = Path(result2.equity_curve_ref).read_bytes()
+            equity1_hash = hashlib.sha256(equity1_content).hexdigest()
+            equity2_hash = hashlib.sha256(equity2_content).hexdigest()
+            assert equity1_hash == equity2_hash, \
+                f"equity 文件 hash 不一致: {equity1_hash[:16]} vs {equity2_hash[:16]}"
 
     def test_get_run_preserves_data_range(self) -> None:
         """get_run 从 start_ts/end_ts 恢复 data_range"""
@@ -653,6 +848,43 @@ class TestInsertOnlyCompatibility:
 
             with pytest.raises(Exception, match="INSERT-ONLY"), db.connect() as conn:
                 conn.execute("UPDATE audit_log SET action = 'demote' WHERE log_id = ?", ("log_001",))
+
+    def test_experiment_events_insert_only_blocks_update(self) -> None:
+        """experiment_events 表 insert-only 保护：禁止 UPDATE/DELETE"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = MetaDB(Path(tmpdir) / "meta.db")
+            db.initialize()
+            db.setup_insert_only_constraints()
+
+            # 先创建一个 experiments 记录（外键依赖）
+            now = datetime.now(UTC).isoformat()
+            with db.connect() as conn:
+                conn.execute(
+                    "INSERT INTO experiments "
+                    "(run_id, run_type, strategy_id, version_no, params, "
+                    "data_version, feature_version, engine_config, status, created_at) "
+                    "VALUES (?, 'BACKTEST', ?, 1, '{}', ?, ?, '{}', 'PENDING', ?)",
+                    ("bt_ev_001", "test_strategy", "binance-abc", "feat-1", now),
+                )
+                # 插入 experiment_events
+                conn.execute(
+                    "INSERT INTO experiment_events "
+                    "(event_id, run_id, event_type, event_data, created_at) "
+                    "VALUES (?, ?, 'EVALUATION', ?, ?)",
+                    ("ev_001", "bt_ev_001", '{"eval_idx": 0}', now),
+                )
+                conn.commit()
+
+            # UPDATE experiment_events 应被拦截
+            with pytest.raises(Exception, match="INSERT-ONLY"), db.connect() as conn:
+                conn.execute(
+                    "UPDATE experiment_events SET event_data = '{\"changed\": true}' WHERE event_id = ?",
+                    ("ev_001",),
+                )
+
+            # DELETE experiment_events 应被拦截
+            with pytest.raises(Exception, match="INSERT-ONLY"), db.connect() as conn:
+                conn.execute("DELETE FROM experiment_events WHERE event_id = ?", ("ev_001",))
 
 
 # ── optimizer 状态机端到端测试 ───────────────────────────

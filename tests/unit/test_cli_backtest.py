@@ -1,6 +1,7 @@
-"""M3.2 CLI 端到端测试：backtest → list-runs → experiment show → compare → rerun → optimize
+"""M3.3 CLI 端到端测试：backtest → list-runs → experiment show/compare/rerun → optimize
 
 使用 Typer CliRunner + mock 数据 + 临时数据目录，真实调用 CLI 命令。
+覆盖成功路径和错误路径。
 """
 
 from __future__ import annotations
@@ -69,40 +70,47 @@ def _make_bars_sequence(start: datetime, count: int) -> list[Bar]:
     return bars
 
 
+def _build_cli_container(tmp_path: Path, bars: list[Bar] | None = None) -> MagicMock:
+    """构建 CLI 测试用 mock 容器"""
+    from qps.data.provider import DataProvider
+    from qps.infra.storage.meta_db import MetaDB
+    from qps.research.experiments import ExperimentStore
+
+    mock_dp = MagicMock(spec=DataProvider)
+    mock_dp.get_bars = AsyncMock(return_value=bars or [])
+    mock_dp.get_funding_rates = AsyncMock(return_value=[])
+    mock_dp.get_mark_prices = AsyncMock(return_value=[])
+
+    mock_container = MagicMock()
+    mock_container.config = MagicMock()
+    mock_container.config.data_dir = tmp_path
+    mock_container.meta_db = MetaDB(tmp_path / "meta.db")
+    mock_container.meta_db.initialize()
+    mock_container.meta_db.setup_insert_only_constraints()
+
+    store = ExperimentStore(meta_db=mock_container.meta_db, data_dir=tmp_path)
+
+    def get_port(name: str) -> object:
+        if name == "data_provider":
+            return mock_dp
+        if name == "experiment_store":
+            return store
+        if name == "strategy_registry":
+            raise KeyError("strategy_registry 未注册")
+        raise KeyError(name)
+
+    mock_container.get_port = MagicMock(side_effect=get_port)
+
+    return mock_container
+
+
 class TestCLIBacktest:
     """CLI backtest 端到端"""
 
     def test_backtest_run(self, tmp_path: Path) -> None:
         """qps research backtest 成功执行"""
         bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 30)
-
-        # Mock build_container 和 DataProvider
-        from qps.data.provider import DataProvider
-        from qps.infra.storage.meta_db import MetaDB
-        from qps.research.experiments import ExperimentStore
-
-        mock_dp = MagicMock(spec=DataProvider)
-        mock_dp.get_bars = AsyncMock(return_value=bars)
-        mock_dp.get_funding_rates = AsyncMock(return_value=[])
-        mock_dp.get_mark_prices = AsyncMock(return_value=[])
-
-        mock_container = MagicMock()
-        mock_container.config = MagicMock()
-        mock_container.config.data_dir = tmp_path
-        mock_container.meta_db = MetaDB(tmp_path / "meta.db")
-        mock_container.meta_db.initialize()
-        mock_container.meta_db.setup_insert_only_constraints()
-
-        store = ExperimentStore(meta_db=mock_container.meta_db, data_dir=tmp_path)
-
-        def get_port(name: str) -> object:
-            if name == "data_provider":
-                return mock_dp
-            if name == "experiment_store":
-                return store
-            raise KeyError(name)
-
-        mock_container.get_port = MagicMock(side_effect=get_port)
+        mock_container = _build_cli_container(tmp_path, bars=bars)
 
         with patch("qps.di.build_container", return_value=mock_container):
             result = runner.invoke(app, [
@@ -119,33 +127,7 @@ class TestCLIBacktest:
     def test_backtest_with_cost_config(self, tmp_path: Path) -> None:
         """qps research backtest --cost-config 成功"""
         bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 20)
-
-        from qps.data.provider import DataProvider
-        from qps.infra.storage.meta_db import MetaDB
-        from qps.research.experiments import ExperimentStore
-
-        mock_dp = MagicMock(spec=DataProvider)
-        mock_dp.get_bars = AsyncMock(return_value=bars)
-        mock_dp.get_funding_rates = AsyncMock(return_value=[])
-        mock_dp.get_mark_prices = AsyncMock(return_value=[])
-
-        mock_container = MagicMock()
-        mock_container.config = MagicMock()
-        mock_container.config.data_dir = tmp_path
-        mock_container.meta_db = MetaDB(tmp_path / "meta.db")
-        mock_container.meta_db.initialize()
-        mock_container.meta_db.setup_insert_only_constraints()
-
-        store = ExperimentStore(meta_db=mock_container.meta_db, data_dir=tmp_path)
-
-        def get_port(name: str) -> object:
-            if name == "data_provider":
-                return mock_dp
-            if name == "experiment_store":
-                return store
-            raise KeyError(name)
-
-        mock_container.get_port = MagicMock(side_effect=get_port)
+        mock_container = _build_cli_container(tmp_path, bars=bars)
 
         with patch("qps.di.build_container", return_value=mock_container):
             result = runner.invoke(app, [
@@ -177,8 +159,8 @@ class TestCLIExperiment:
 
         assert result.exit_code == 0
 
-    def test_experiment_show(self, tmp_path: Path) -> None:
-        """qps experiment show 成功"""
+    def test_experiment_show_nonexistent(self, tmp_path: Path) -> None:
+        """qps experiment show 不存在的 run_id 应返回错误"""
         from qps.infra.storage.meta_db import MetaDB
 
         mock_container = MagicMock()
@@ -192,7 +174,101 @@ class TestCLIExperiment:
             result = runner.invoke(app, ["experiment", "show", "nonexistent_run_id"])
 
         # 不存在的 run_id 应返回错误
-        assert result.exit_code != 0 or "失败" in result.output
+        assert result.exit_code != 0 or "失败" in result.output or "不存在" in result.output
+
+    def test_experiment_show_success(self, tmp_path: Path) -> None:
+        """qps experiment show 成功路径：先回测创建 run → show 该 run_id"""
+        bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 30)
+        mock_container = _build_cli_container(tmp_path, bars=bars)
+
+        # 先执行回测创建 run
+        with patch("qps.di.build_container", return_value=mock_container):
+            bt_result = runner.invoke(app, [
+                "research", "backtest", "test_strat",
+                "--range", "2026-01-01:2026-01-31",
+                "--json",
+            ])
+        assert bt_result.exit_code == 0, f"回测失败: {bt_result.output}"
+        bt_output = json.loads(bt_result.output)
+        run_id = bt_output["run_id"]
+
+        # 再 show 该 run_id
+        with patch("qps.di.build_container", return_value=mock_container):
+            show_result = runner.invoke(app, [
+                "experiment", "show", run_id, "--json",
+            ])
+
+        assert show_result.exit_code == 0, f"show 失败: {show_result.output}"
+        show_output = json.loads(show_result.output)
+        assert show_output["run_id"] == run_id
+        assert show_output["status"] == "SUCCEEDED"
+
+    def test_experiment_compare_success(self, tmp_path: Path) -> None:
+        """qps experiment compare 成功路径：两次回测 → compare 两个 run_id（含 OOS 列）"""
+        bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 50)
+        mock_container = _build_cli_container(tmp_path, bars=bars)
+
+        # 第一次回测
+        with patch("qps.di.build_container", return_value=mock_container):
+            bt1_result = runner.invoke(app, [
+                "research", "backtest", "test_strat",
+                "--range", "2026-01-01:2026-01-31",
+                "--json",
+            ])
+        assert bt1_result.exit_code == 0, f"回测1失败: {bt1_result.output}"
+        run_id_1 = json.loads(bt1_result.output)["run_id"]
+
+        # 第二次回测（不同参数）
+        with patch("qps.di.build_container", return_value=mock_container):
+            bt2_result = runner.invoke(app, [
+                "research", "backtest", "test_strat",
+                "--params", '{"entry_z": 1.5, "position_size": "0.2"}',
+                "--range", "2026-01-01:2026-01-31",
+                "--json",
+            ])
+        assert bt2_result.exit_code == 0, f"回测2失败: {bt2_result.output}"
+        run_id_2 = json.loads(bt2_result.output)["run_id"]
+
+        # compare 两个 run
+        with patch("qps.di.build_container", return_value=mock_container):
+            compare_result = runner.invoke(app, [
+                "experiment", "compare", run_id_1, run_id_2, "--json",
+            ])
+
+        assert compare_result.exit_code == 0, f"compare 失败: {compare_result.output}"
+        compare_output = json.loads(compare_result.output)
+        assert run_id_1 in compare_output["run_ids"]
+        assert run_id_2 in compare_output["run_ids"]
+        # 含 OOS 列
+        oos_metrics = [m for m in compare_output["metric_names"] if m.startswith("oos_")]
+        assert len(oos_metrics) > 0, f"compare 应含 OOS 指标列，实际 {compare_output['metric_names']}"
+
+    def test_experiment_rerun_success(self, tmp_path: Path) -> None:
+        """qps experiment rerun 成功路径：先回测 → rerun 该 run_id"""
+        bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 30)
+        mock_container = _build_cli_container(tmp_path, bars=bars)
+
+        # 先执行回测创建 run
+        with patch("qps.di.build_container", return_value=mock_container):
+            bt_result = runner.invoke(app, [
+                "research", "backtest", "test_strat",
+                "--range", "2026-01-01:2026-01-31",
+                "--json",
+            ])
+        assert bt_result.exit_code == 0, f"回测失败: {bt_result.output}"
+        bt_output = json.loads(bt_result.output)
+        run_id = bt_output["run_id"]
+
+        # rerun 该 run_id
+        with patch("qps.di.build_container", return_value=mock_container):
+            rerun_result = runner.invoke(app, [
+                "experiment", "rerun", run_id, "--json",
+            ])
+
+        assert rerun_result.exit_code == 0, f"rerun 失败: {rerun_result.output}"
+        rerun_output = json.loads(rerun_result.output)
+        assert rerun_output["status"] == "SUCCEEDED"
+        assert rerun_output["run_id"] != run_id, "rerun 应产生新 run_id"
 
 
 class TestCLIOptimize:
