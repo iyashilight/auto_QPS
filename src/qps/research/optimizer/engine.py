@@ -325,20 +325,24 @@ class Optimizer:
         for name, spec in search_space.items():
             param_names.append(name)
             if isinstance(spec, dict):
-                low = spec.get("low", spec.get("min", 0))
-                high = spec.get("high", spec.get("max", 1))
-                step = spec.get("step", 1)
-                if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+                # 优先检查 values 列表
+                if isinstance(spec.get("values"), list):
+                    param_values.append(spec["values"])
+                elif isinstance(spec.get("low"), (int, float)) or isinstance(spec.get("min"), (int, float)):
+                    low_val = spec.get("low", spec.get("min", 0))
+                    high_val = spec.get("high", spec.get("max", 1))
+                    step_val = spec.get("step", 1)
+                    low = float(low_val) if low_val is not None else 0.0
+                    high = float(high_val) if high_val is not None else 1.0
+                    step = float(step_val) if step_val is not None else 1.0
                     vals: list[Any] = []
                     v = low
-                    while v <= high:
-                        vals.append(v)
+                    while v <= high + 1e-9:  # 浮点容差
+                        vals.append(round(v, 10))
                         v += step
                     param_values.append(vals)
-                elif isinstance(spec.get("values"), list):
-                    param_values.append(spec["values"])
                 else:
-                    param_values.append([low])
+                    param_values.append([spec.get("low", spec.get("min", 0))])
             elif isinstance(spec, list):
                 param_values.append(spec)
             else:
