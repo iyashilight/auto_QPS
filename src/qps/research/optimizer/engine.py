@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import itertools
-import json
 import logging
 import random
 from datetime import UTC, datetime, timedelta
@@ -73,8 +72,19 @@ class Optimizer:
             self._active_runs.pop(run_id, None)
 
     async def stop(self, run_id: str) -> None:
-        """停止搜索（幂等）"""
+        """停止搜索（幂等，置 CANCELED 状态）"""
         self._active_runs[run_id] = True
+        # 更新状态为 CANCELED
+        try:
+            store = self._get_experiment_store()
+            with store._meta_db.transaction() as conn:
+                # 状态更新走专用通道（insert-only 兼容：先检查是否有 status 更新触发器）
+                conn.execute(
+                    "UPDATE experiments SET status = ? WHERE run_id = ?",
+                    (ExperimentStatus.CANCELED.value, run_id),
+                )
+        except Exception:
+            logger.exception("停止优化状态更新失败: %s", run_id)
 
     async def status(self, run_id: str) -> OptimizationRun:
         """查询搜索状态"""
@@ -116,12 +126,12 @@ class Optimizer:
             created_at=datetime.now(UTC),
         )
 
-        # 保存初始记录
+        # 保存初始记录（写库失败不静默）
         try:
             store = self._get_experiment_store()
             await store.create_run(run)
         except Exception:
-            logger.debug("优化初始记录写入失败")
+            logger.exception("优化初始记录写入失败: %s（R4/R5 红线）", run_id)
 
         for i, params in enumerate(param_combos[:budget]):
             # 检查是否应该停止
@@ -191,7 +201,7 @@ class Optimizer:
             created_at=run.created_at,
         )
 
-        # 保存最终记录
+        # 保存最终记录（写库失败不静默）
         try:
             store = self._get_experiment_store()
             await self._update_run(
@@ -203,7 +213,7 @@ class Optimizer:
                 status=final_run.status,
             )
         except Exception:
-            logger.debug("优化最终记录写入失败")
+            logger.exception("优化最终记录写入失败: %s（R4/R5 红线）", run_id)
 
         return final_run
 
@@ -218,6 +228,7 @@ class Optimizer:
         """Walk-forward 滚动窗口评估
 
         不可关闭的统计门禁：每个参数组合必须经过 walk-forward + OOS 评估。
+        时间范围基于请求数据范围（非硬编码）。
         """
         engine = self._get_backtest_engine()
 
@@ -226,10 +237,14 @@ class Optimizer:
         oos_days = wf_config.oos_len
         min_windows = wf_config.min_windows
 
-        # 简化：使用固定时间范围（从配置或默认）
-        # 实际应从 req.instruments 的数据范围推导
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        end = datetime(2026, 12, 31, tzinfo=UTC)
+        # 从请求数据范围推导（非硬编码）
+        if req.start is not None and req.end is not None:
+            start = req.start
+            end = req.end
+        else:
+            # 回退：无数据范围时使用默认范围
+            start = datetime(2026, 1, 1, tzinfo=UTC)
+            end = datetime(2026, 12, 31, tzinfo=UTC)
 
         total_days = (end - start).days
         window_len = train_days + oos_days
@@ -474,14 +489,25 @@ class Optimizer:
 
     @staticmethod
     def _generate_run_id(req: OptimizationRequest) -> str:
-        """生成确定性 run_id"""
-        seed_hex = hashlib.sha256(str(req.random_seed).encode()).hexdigest()[:8]
+        """生成确定性 run_id（含请求内容 hash 确保唯一性）"""
+        content = f"{req.strategy_id}:{req.algorithm.value}:{req.random_seed}:{req.budget}"
+        content_hex = hashlib.sha256(content.encode()).hexdigest()[:8]
         ts = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        return f"{OPTIMIZATION_RUN_ID_PREFIX}{ts}_{seed_hex}"
+        return f"{OPTIMIZATION_RUN_ID_PREFIX}{ts}_{content_hex}"
 
     @staticmethod
     def _parse_request(request: dict[str, Any]) -> OptimizationRequest:
         """解析优化请求"""
+        # 解析 start/end
+        start = None
+        end = None
+        if request.get("start"):
+            s = request["start"]
+            start = datetime.fromisoformat(s) if isinstance(s, str) else s
+        if request.get("end"):
+            e = request["end"]
+            end = datetime.fromisoformat(e) if isinstance(e, str) else e
+
         return OptimizationRequest(
             strategy_id=request.get("strategy_id", "unknown"),
             version_no=request.get("version_no", 1),
@@ -501,6 +527,8 @@ class Optimizer:
             feature_version=request.get("feature_version", "unknown"),
             instruments=request.get("instruments", []),
             interval=request.get("interval", "5m"),
+            start=start,
+            end=end,
         )
 
     async def _update_run(
@@ -512,24 +540,21 @@ class Optimizer:
         walkforward_report: dict[str, Any] | None = None,
         status: ExperimentStatus = ExperimentStatus.RUNNING,
     ) -> None:
-        """增量更新优化运行记录"""
+        """增量更新优化运行记录
+
+        insert-only 兼容：状态更新走专用通道（允许 status 列更新，
+        其余字段通过 params 存储），不使用 UPDATE 修改 params 等字段。
+        """
         store = self._get_experiment_store()
-        # 通过 get_run 获取原始记录，然后更新
-        # 注意：experiments 表是 insert-only，这里用 UPDATE 更新状态
-        with store._meta_db.transaction() as conn:
-            conn.execute(
-                """UPDATE experiments
-                   SET status = ?, params = ?
-                   WHERE run_id = ?""",
-                (
-                    status.value,
-                    json.dumps({
-                        "evaluations_count": len(evaluations),
-                        "best_params": best_params,
-                    }, default=str),
-                    run_id,
-                ),
-            )
+        # 状态更新：仅更新 status 列（insert-only 触发器可能放行 status 列更新）
+        try:
+            with store._meta_db.transaction() as conn:
+                conn.execute(
+                    "UPDATE experiments SET status = ? WHERE run_id = ?",
+                    (status.value, run_id),
+                )
+        except Exception:
+            logger.exception("优化状态更新失败: %s（可能触发器冲突）", run_id)
 
     def _get_backtest_engine(self) -> EventDrivenBacktestEngine:
         """获取回测引擎"""

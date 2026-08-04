@@ -511,6 +511,7 @@ def research_backtest(
     interval: str = typer.Option("5m", "--interval", "-i", help="K 线间隔"),
     range_str: str | None = typer.Option(None, "--range", help="时间范围 START:END (ISO 8601)"),
     instruments: str | None = typer.Option(None, "--instruments", help="标的列表，逗号分隔"),
+    cost_config: str | None = typer.Option(None, "--cost-config", help="成本配置 JSON"),
     json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """策略回测"""
@@ -524,6 +525,15 @@ def research_backtest(
             params_dict = json.loads(params)
         except json.JSONDecodeError as e:
             typer.echo(f"❌ 参数 JSON 格式错误: {e}", err=True)
+            raise typer.Exit(code=2) from e
+
+    # 解析成本配置
+    cost_config_dict: dict[str, Any] = {}
+    if cost_config:
+        try:
+            cost_config_dict = json.loads(cost_config)
+        except json.JSONDecodeError as e:
+            typer.echo(f"❌ 成本配置 JSON 格式错误: {e}", err=True)
             raise typer.Exit(code=2) from e
 
     # 解析时间范围
@@ -564,6 +574,8 @@ def research_backtest(
         "data_version": "unknown",
         "feature_version": "unknown",
     }
+    if cost_config_dict:
+        request["cost_config"] = cost_config_dict
 
     async def _run() -> None:
         config = Config()
@@ -611,6 +623,11 @@ def research_optimize(
     algorithm: str = typer.Option("grid", "--algorithm", "-a", help="搜索算法 (grid/random/bayesian)"),
     budget: int = typer.Option(1000, "--budget", "-b", help="搜索预算"),
     objective: str | None = typer.Option(None, "--objective", help="目标函数 JSON"),
+    search_space: str | None = typer.Option(None, "--search-space", help="搜索空间 JSON"),
+    instruments: str | None = typer.Option(None, "--instruments", help="标的列表，逗号分隔"),
+    interval: str = typer.Option("5m", "--interval", "-i", help="K 线间隔"),
+    range_str: str | None = typer.Option(None, "--range", help="时间范围 START:END (ISO 8601)"),
+    seed: int = typer.Option(42, "--seed", "-s", help="随机种子"),
     json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """参数优化"""
@@ -627,6 +644,34 @@ def research_optimize(
             typer.echo(f"❌ 目标函数 JSON 格式错误: {e}", err=True)
             raise typer.Exit(code=2) from e
 
+    # 解析搜索空间（空 search_space 报错）
+    search_space_dict: dict[str, Any] = {}
+    if search_space:
+        try:
+            search_space_dict = json.loads(search_space)
+        except json.JSONDecodeError as e:
+            typer.echo(f"❌ 搜索空间 JSON 格式错误: {e}", err=True)
+            raise typer.Exit(code=2) from e
+    if not search_space_dict:
+        typer.echo("❌ 搜索空间不能为空，请通过 --search-space 提供", err=True)
+        raise typer.Exit(code=2)
+
+    # 解析标的列表
+    instrument_list = ["binance-btc-usdt-perp"]
+    if instruments:
+        instrument_list = [_make_instrument_id(i.strip()) for i in instruments.split(",")]
+
+    # 解析时间范围
+    start_str: str | None = None
+    end_str: str | None = None
+    if range_str:
+        parts = range_str.split(":")
+        if len(parts) != 2:
+            typer.echo("❌ --range 格式: START:END (ISO 8601)", err=True)
+            raise typer.Exit(code=2)
+        start_str = parts[0]
+        end_str = parts[1]
+
     # 验证算法
     valid_algorithms = ("grid", "random", "bayesian")
     if algorithm not in valid_algorithms:
@@ -638,7 +683,17 @@ def research_optimize(
         "algorithm": algorithm.upper(),
         "budget": budget,
         "objective": objective_dict,
+        "search_space": search_space_dict,
+        "instruments": instrument_list,
+        "interval": interval,
+        "random_seed": seed,
+        "data_version": "unknown",
+        "feature_version": "unknown",
     }
+    if start_str:
+        request["start"] = start_str
+    if end_str:
+        request["end"] = end_str
 
     async def _run() -> None:
         config = Config()

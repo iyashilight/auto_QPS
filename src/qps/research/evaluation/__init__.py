@@ -201,10 +201,12 @@ def compute_alpha_score(
     strategy_id: str,
     version_no: int,
     metrics: Metrics,
+    evaluated_at: datetime | None = None,
 ) -> AlphaScore:
     """计算 Alpha Score 六维度（信号级，ADR-006 并入 M3）
 
     数据来源限定回测输出，无 LLM/向量/外部依赖。
+    evaluated_at 注入固定 clock 以保证确定性。
     """
     # opportunity: 交易频率
     daily_freq = Decimal(str(metrics.trade_count)) / Decimal("252") if metrics.trade_count > 0 else Decimal("0")
@@ -229,7 +231,7 @@ def compute_alpha_score(
         score_id=f"alpha_{run_id}",
         strategy_id=strategy_id,
         version_no=version_no,
-        evaluated_at=datetime.now(UTC),
+        evaluated_at=evaluated_at or datetime.now(UTC),
         run_id=run_id,
         opportunity=opportunity,
         confidence=confidence,

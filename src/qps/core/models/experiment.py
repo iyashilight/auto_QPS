@@ -108,8 +108,17 @@ class OptimizationRequest(BaseModel):
     feature_version: str = Field(description="特征版本")
     instruments: list[str] = Field(default_factory=list, description="标的列表")
     interval: str = Field(default="5m", description="K 线间隔")
+    start: datetime | None = Field(default=None, description="回测开始时间（UTC）")
+    end: datetime | None = Field(default=None, description="回测结束时间（UTC）")
 
     model_config = {"frozen": True}
+
+    @field_validator("start", "end")
+    @classmethod
+    def _validate_datetime_timezone(cls, v: datetime | None) -> datetime | None:
+        if v is None:
+            return None
+        return validate_utc_datetime(v)
 
 
 # ── 指标 ──────────────────────────────────────────────────

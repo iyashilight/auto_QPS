@@ -205,6 +205,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     feature_version   TEXT NOT NULL,
     engine_config     TEXT NOT NULL,
     environment_lock  TEXT,
+    start_ts          TEXT,
+    end_ts            TEXT,
     status            TEXT NOT NULL,
     created_at        TEXT NOT NULL
 );

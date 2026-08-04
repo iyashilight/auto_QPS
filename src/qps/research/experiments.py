@@ -40,31 +40,45 @@ class ExperimentStore:
 
     async def create_run(self, run: BacktestRun | OptimizationRun) -> None:
         """创建实验记录（insert-only）"""
+        # 提取 start/end 时间戳
+        start_ts: str | None = None
+        end_ts: str | None = None
+
         if isinstance(run, BacktestRun):
             run_type = "BACKTEST"
             params = json.dumps(run.params, default=_json_default)
             engine_config = json.dumps(run.engine_config, default=_json_default)
             env_lock = run.environment_lock
+            start_ts = run.data_range.start.isoformat()
+            end_ts = run.data_range.end.isoformat()
         else:
             run_type = "OPTIMIZATION"
             params = json.dumps({
                 "search_space": run.search_space,
                 "objective": run.objective,
                 "algorithm": run.algorithm.value,
+                "best_params": run.best_params,
+                "evaluations": run.evaluations,
+                "walkforward_report": run.walkforward_report,
             }, default=_json_default)
             engine_config = json.dumps({
                 "algorithm": run.algorithm.value,
                 "walkforward_report": run.walkforward_report,
             }, default=_json_default)
             env_lock = None
+            # 优化器从 engine_config 或 search_space 提取时间范围
+            if hasattr(run, "start") and run.start is not None:
+                start_ts = run.start.isoformat() if hasattr(run.start, "isoformat") else str(run.start)
+            if hasattr(run, "end") and run.end is not None:
+                end_ts = run.end.isoformat() if hasattr(run.end, "isoformat") else str(run.end)
 
         with self._meta_db.transaction() as conn:
             conn.execute(
                 """INSERT INTO experiments
                    (run_id, run_type, strategy_id, version_no, params,
                     data_version, feature_version, engine_config,
-                    environment_lock, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    environment_lock, start_ts, end_ts, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run.run_id,
                     run_type,
@@ -75,6 +89,8 @@ class ExperimentStore:
                     run.feature_version,
                     engine_config,
                     env_lock,
+                    start_ts,
+                    end_ts,
                     run.status.value,
                     run.created_at.isoformat(),
                 ),
@@ -96,16 +112,21 @@ class ExperimentStore:
         engine_config = json.loads(row["engine_config"])
         created_at = datetime.fromisoformat(row["created_at"])
 
+        # 从 start_ts/end_ts 恢复 data_range
+        start_ts = row["start_ts"]
+        end_ts = row["end_ts"]
+        data_range = DataRange(
+            start=datetime.fromisoformat(start_ts) if start_ts else datetime(2026, 1, 1, tzinfo=UTC),
+            end=datetime.fromisoformat(end_ts) if end_ts else datetime(2026, 1, 2, tzinfo=UTC),
+        )
+
         if run_type == "BACKTEST":
             return BacktestRun(
                 run_id=row["run_id"],
                 strategy_id=row["strategy_id"],
                 version_no=row["version_no"],
                 params=params,
-                data_range=DataRange(
-                    start=datetime(2026, 1, 1, tzinfo=UTC),
-                    end=datetime(2026, 1, 2, tzinfo=UTC),
-                ),
+                data_range=data_range,
                 data_version=row["data_version"],
                 feature_version=row["feature_version"],
                 engine_config=engine_config,
@@ -113,13 +134,18 @@ class ExperimentStore:
                 status=ExperimentStatus(row["status"]),
                 created_at=created_at,
             )
+
+        # OptimizationRun：从 params 恢复完整字段
         return OptimizationRun(
             run_id=row["run_id"],
             strategy_id=row["strategy_id"],
             version_no=row["version_no"],
-            search_space=engine_config.get("search_space", {}),
-            objective=engine_config.get("objective", {}),
-            algorithm=engine_config.get("algorithm", "GRID"),
+            search_space=params.get("search_space", {}),
+            objective=params.get("objective", {}),
+            algorithm=params.get("algorithm", "GRID"),
+            evaluations=params.get("evaluations", []),
+            best_params=params.get("best_params"),
+            walkforward_report=params.get("walkforward_report"),
             data_version=row["data_version"],
             feature_version=row["feature_version"],
             status=ExperimentStatus(row["status"]),

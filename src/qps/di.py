@@ -127,6 +127,10 @@ def build_container(config: Config) -> Container:
     app_config = validate_config(config.raw_data)
     container = Container(config, app_config)
 
+    # ── 初始化元数据库（建表 + insert-only 约束）──
+    container.meta_db.initialize()
+    container.meta_db.setup_insert_only_constraints()
+
     # ── M1: Exchange Adapter & Market Adapter ─────────────
     from qps.broker.exchange_adapter.binance_exchange_adapter import (
         BinanceExchangeAdapter,

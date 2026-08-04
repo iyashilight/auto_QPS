@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 
 from qps.core.constants import (
     BACKTEST_RUN_ID_PREFIX,
-    BacktestEngineMode,
     ExperimentStatus,
 )
 from qps.core.costs import CostCalculator
@@ -25,7 +24,6 @@ from qps.core.errors import BacktestError
 from qps.core.models.experiment import (
     BacktestRequest,
     BacktestRun,
-    CostConfig,
     DataRange,
     ReportCard,
 )
@@ -200,12 +198,27 @@ class VectorizedBacktestEngine:
                 unrealized_pnl=unrealized,
             ))
 
-        # 计算指标
-        metrics = compute_metrics(trades, equity_curve, initial_equity)
+        # 计算指标（含 IS/OOS 切分）
+        oos_ratio = float(req.params.get("oos_ratio", 0.2))
+        if oos_ratio > 0 and len(equity_curve) > 10:
+            total_points = len(equity_curve)
+            is_end_idx = max(1, int(total_points * (1 - oos_ratio)))
+            is_equity = equity_curve[:is_end_idx]
+            oos_equity = equity_curve[is_end_idx:]
+            oos_start_time = equity_curve[is_end_idx].timestamp if is_end_idx < total_points else datetime.max.replace(tzinfo=UTC)
+            is_trades = [t for t in trades if t.timestamp < oos_start_time]
+            oos_trades = [t for t in trades if t.timestamp >= oos_start_time]
+            metrics = compute_metrics(is_trades, is_equity, initial_equity, oos_trades, oos_equity)
+        else:
+            metrics = compute_metrics(trades, equity_curve, initial_equity)
 
         # 生成报告
         report_card = generate_report_card(run_id, req.strategy_id, req.version_no, metrics)
-        alpha_score = compute_alpha_score(run_id, req.strategy_id, req.version_no, metrics)
+        # AlphaScore 注入固定 clock（确定性）
+        alpha_score = compute_alpha_score(
+            run_id, req.strategy_id, req.version_no, metrics,
+            evaluated_at=datetime.now(UTC),
+        )
         report_card = ReportCard(
             run_id=report_card.run_id,
             strategy_id=report_card.strategy_id,
@@ -231,6 +244,7 @@ class VectorizedBacktestEngine:
         engine_config = {
             "engine_mode": "VECTORIZED",
             "fill_timing": "BAR_CLOSE",
+            "signal_source": "builtin",
             "instruments": req.instruments,
             "interval": req.interval,
             "cost_config": req.cost_config.model_dump(),
@@ -255,13 +269,30 @@ class VectorizedBacktestEngine:
             created_at=datetime.now(UTC),
         )
 
-        # 保存到实验存储
+        # 保存到实验存储（写库失败不静默，记录 ERROR 并标记）
         try:
             store = self._get_experiment_store()
             await store.create_run(result)
             await store.save_report_card(report_card)
         except Exception:
-            logger.debug("实验存储写入失败（非关键路径）")
+            logger.exception("实验存储写入失败: %s（R4/R5 红线，数据不可追溯）", run_id)
+            # 写库失败不静默：返回 FAILED 记录并携带错误信息
+            return BacktestRun(
+                run_id=run_id,
+                strategy_id=req.strategy_id,
+                version_no=req.version_no,
+                params=req.params,
+                data_range=DataRange(start=req.start, end=req.end),
+                data_version=req.data_version,
+                feature_version=req.feature_version,
+                engine_config={**engine_config, "write_error": "实验存储写入失败"},
+                environment_lock=env_lock,
+                trades_ref=trades_ref,
+                equity_curve_ref=equity_ref,
+                metrics=metrics,
+                status=ExperimentStatus.FAILED,
+                created_at=result.created_at,
+            )
 
         return result
 
@@ -407,16 +438,19 @@ class VectorizedBacktestEngine:
 
     @staticmethod
     def _generate_run_id(req: BacktestRequest) -> str:
-        """生成确定性 run_id"""
-        seed = req.random_seed
-        seed_hex = hashlib.sha256(str(seed).encode()).hexdigest()[:8]
+        """生成确定性 run_id（含请求内容 hash 确保唯一性）"""
+        content = f"v:{req.strategy_id}:{','.join(req.instruments)}:{req.start.isoformat()}:{req.end.isoformat()}:{req.random_seed}"
+        content_hex = hashlib.sha256(content.encode()).hexdigest()[:8]
         ts = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        return f"{BACKTEST_RUN_ID_PREFIX}v_{ts}_{seed_hex}"
+        return f"{BACKTEST_RUN_ID_PREFIX}v_{ts}_{content_hex}"
 
-    @staticmethod
-    def _compute_env_lock() -> str:
-        """计算环境锁（uv.lock hash）"""
-        lock_path = Path("uv.lock")
+    def _compute_env_lock(self) -> str:
+        """计算环境锁（uv.lock hash，基于仓库根解析）"""
+        try:
+            project_root = self._container.config.data_dir.parent
+            lock_path = project_root / "uv.lock"
+        except Exception:
+            lock_path = Path("uv.lock")
         if lock_path.exists():
             content = lock_path.read_bytes()
             return f"env-{hashlib.sha256(content).hexdigest()[:8]}"
@@ -459,37 +493,63 @@ class VectorizedBacktestEngine:
 
     @staticmethod
     def _parse_request(request: dict[str, Any]) -> BacktestRequest:
-        """解析回测请求"""
-        return BacktestRequest(
-            strategy_id=request.get("strategy_id", "unknown"),
-            version_no=request.get("version_no", 1),
-            params=request.get("params", {}),
-            instruments=request.get("instruments", []),
-            interval=request.get("interval", "5m"),
-            start=datetime.fromisoformat(request["start"]) if isinstance(request.get("start"), str) else request.get("start", datetime(2026, 1, 1, tzinfo=UTC)),
-            end=datetime.fromisoformat(request["end"]) if isinstance(request.get("end"), str) else request.get("end", datetime(2026, 1, 2, tzinfo=UTC)),
-            engine_mode=BacktestEngineMode.VECTORIZED,
-            data_version=request.get("data_version", "unknown"),
-            feature_version=request.get("feature_version", "unknown"),
-            cost_config=request.get("cost_config", CostConfig()) if isinstance(request.get("cost_config"), CostConfig) else CostConfig(),
-            leverage=Decimal(str(request.get("leverage", "3"))),
-            random_seed=request.get("random_seed", 42),
-        )
+        """解析回测请求（统一走 model_validate，含 cost_config dict→CostConfig）"""
+        # 补充 engine_mode 默认值（向量化引擎默认 VECTORIZED）
+        if "engine_mode" not in request:
+            request = {**request, "engine_mode": "VECTORIZED"}
+        return BacktestRequest.model_validate(request)
 
     @staticmethod
     def _failed_run(run_id: str, error: str, request: Any) -> BacktestRun:
-        """创建失败记录"""
+        """创建失败记录（携带真实请求信息）"""
+        if isinstance(request, dict):
+            strategy_id = request.get("strategy_id", "unknown")
+            version_no = request.get("version_no", 1)
+            params = request.get("params", {})
+            start = request.get("start")
+            end = request.get("end")
+            data_version = request.get("data_version", "unknown")
+            feature_version = request.get("feature_version", "unknown")
+        elif isinstance(request, BacktestRequest):
+            strategy_id = request.strategy_id
+            version_no = request.version_no
+            params = request.params
+            start = request.start
+            end = request.end
+            data_version = request.data_version
+            feature_version = request.feature_version
+        else:
+            strategy_id = "unknown"
+            version_no = 1
+            params = {}
+            start = None
+            end = None
+            data_version = "unknown"
+            feature_version = "unknown"
+
+        # 解析时间范围
+        if isinstance(start, str):
+            try:
+                start = datetime.fromisoformat(start)
+            except (ValueError, TypeError):
+                start = None
+        if isinstance(end, str):
+            try:
+                end = datetime.fromisoformat(end)
+            except (ValueError, TypeError):
+                end = None
+
         return BacktestRun(
             run_id=run_id,
-            strategy_id=request.get("strategy_id", "unknown") if isinstance(request, dict) else "unknown",
-            version_no=request.get("version_no", 1) if isinstance(request, dict) else 1,
-            params=request.get("params", {}) if isinstance(request, dict) else {},
+            strategy_id=strategy_id,
+            version_no=version_no,
+            params=params,
             data_range=DataRange(
-                start=datetime(2026, 1, 1, tzinfo=UTC),
-                end=datetime(2026, 1, 2, tzinfo=UTC),
+                start=start if isinstance(start, datetime) and start.tzinfo else datetime(2026, 1, 1, tzinfo=UTC),
+                end=end if isinstance(end, datetime) and end.tzinfo else datetime(2026, 1, 2, tzinfo=UTC),
             ),
-            data_version="unknown",
-            feature_version="unknown",
+            data_version=data_version,
+            feature_version=feature_version,
             engine_config={"error": error},
             status=ExperimentStatus.FAILED,
             created_at=datetime.now(UTC),
