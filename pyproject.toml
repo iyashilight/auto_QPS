@@ -45,7 +45,7 @@ build-backend = "hatchling.build"
 packages = ["src/qps"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "strategies/demo_mean_reversion/tests"]
 asyncio_mode = "auto"
 addopts = "-v --tb=short"
 markers = [

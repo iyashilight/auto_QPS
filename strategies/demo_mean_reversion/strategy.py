@@ -46,9 +46,6 @@ class Strategy(BaseStrategy):
         """
         instrument_id = bar.instrument_id
 
-        # 更新历史数据（由框架调用）
-        ctx.set_latest_bar(instrument_id, bar)
-
         # ── 从 Feature Pipeline 读取特征 ──────────────────────────────────
         returns = ctx.feature(instrument_id, "returns")
         realized_vol = ctx.feature(instrument_id, "realized_vol_20")

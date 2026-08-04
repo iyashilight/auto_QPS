@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from qps.core.models.account import Position
 from qps.core.models.market import Bar
 from qps.core.sdk.context import (
@@ -86,7 +88,7 @@ class TestParamsReadonly:
     """参数只读测试"""
 
     def test_params_immutable(self) -> None:
-        """params 不可变"""
+        """params 不可变：对返回对象赋值/修改 → TypeError"""
         params = {"lookback": 50}
         ctx = StrategyContext(
             strategy_id="test",
@@ -96,9 +98,9 @@ class TestParamsReadonly:
             instruments=[],
             interval="5m",
         )
-        # 尝试修改会失败（因为 params 是同一个字典引用）
-        # 但策略应该通过 ctx.params 访问，而不是直接修改
-        assert ctx.params == params
+        # MappingProxyType 不允许赋值
+        with pytest.raises(TypeError):
+            ctx.params["lookback"] = 100  # type: ignore[index]
 
     def test_params_not_modifiable(self) -> None:
         """无法通过 ctx.params 修改原始参数"""
@@ -111,10 +113,26 @@ class TestParamsReadonly:
             instruments=[],
             interval="5m",
         )
-        # ctx.params 返回的是同一个对象
-        # 但根据契约，策略不应修改它
-        # 这里只是验证返回的是同一个字典
-        assert ctx.params is params
+        # 尝试修改 params 视图应抛 TypeError
+        with pytest.raises(TypeError):
+            ctx.params["new_key"] = "value"  # type: ignore[index]
+        # 原始数据不受影响
+        assert params == {"lookback": 50}
+
+    def test_params_get_still_works(self) -> None:
+        """ctx.params.get(...) 仍可用（MappingProxyType 兼容）"""
+        params = {"lookback": 50, "entry_z": 2.0}
+        ctx = StrategyContext(
+            strategy_id="test",
+            version_no=1,
+            deployment_id="dep_test",
+            params=params,
+            instruments=[],
+            interval="5m",
+        )
+        assert ctx.params.get("lookback") == 50
+        assert ctx.params.get("missing", "default") == "default"
+        assert "entry_z" in ctx.params
 
 
 class TestPositionsReadonly:
@@ -150,6 +168,65 @@ class TestPositionsReadonly:
         view = PositionView.from_model(pos)
         assert view.side == "LONG"
         assert view.quantity == Decimal("0.1")
+
+    def test_positions_returns_tuple(self) -> None:
+        """ctx.positions 返回 tuple，修改不影响内部状态"""
+        ctx = StrategyContext(
+            strategy_id="test",
+            version_no=1,
+            deployment_id="dep_test",
+            params={},
+            instruments=[],
+            interval="5m",
+        )
+        pos = PositionView(
+            position_id="pos_1",
+            instrument_id="BTC-USDT-PERP",
+            side="LONG",
+            quantity=Decimal("0.1"),
+            entry_price=Decimal("67000"),
+        )
+        ctx.set_positions([pos])
+
+        # 返回的是 tuple
+        assert isinstance(ctx.positions, tuple)
+        assert len(ctx.positions) == 1
+        assert ctx.positions[0].position_id == "pos_1"
+
+    def test_positions_modification_does_not_affect_internal(self) -> None:
+        """修改返回的 positions 不影响内部状态"""
+        ctx = StrategyContext(
+            strategy_id="test",
+            version_no=1,
+            deployment_id="dep_test",
+            params={},
+            instruments=[],
+            interval="5m",
+        )
+        pos = PositionView(
+            position_id="pos_1",
+            instrument_id="BTC-USDT-PERP",
+            side="LONG",
+            quantity=Decimal("0.1"),
+            entry_price=Decimal("67000"),
+        )
+        ctx.set_positions([pos])
+
+        # 获取 positions 后再设置新持仓
+        positions_before = ctx.positions
+        pos2 = PositionView(
+            position_id="pos_2",
+            instrument_id="ETH-USDT-PERP",
+            side="SHORT",
+            quantity=Decimal("1.0"),
+            entry_price=Decimal("3500"),
+        )
+        ctx.set_positions([pos, pos2])
+
+        # 之前获取的 positions 不受影响（tuple 不可变）
+        assert len(positions_before) == 1
+        # 新获取的 positions 反映最新状态
+        assert len(ctx.positions) == 2
 
 
 class TestStateSaveRestore:

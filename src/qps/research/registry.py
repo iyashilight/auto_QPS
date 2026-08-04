@@ -73,6 +73,9 @@ class StrategyRegistry:
     - get_version: 获取策略版本
     - list_versions: 列出所有版本
     - list_strategies: 列出所有策略
+
+    TODO(M4): 接入 qps.infra.storage.meta_db.MetaDB 统一管理表结构与连接池，
+    删除内部自建 DDL，复用 MetaDB 的 canonical 表定义与 insert-only 保护。
     """
 
     def __init__(self, db_path: Path | str) -> None:
@@ -84,6 +87,7 @@ class StrategyRegistry:
         self.db_path = Path(db_path)
         # 沙箱使用默认白名单，allow_imports 在 save_version 时从 code_pack 提取
         self._sandbox = Sandbox()
+        # TODO(M4): 改用 MetaDB.initialize() 建表，删除 _init_db 自建 DDL
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -170,13 +174,16 @@ class StrategyRegistry:
         if existing:
             return existing
 
-        # 2. 静态检查（使用 runtime_constraints.allow_imports 扩展白名单）
+        # 2. 静态检查（使用 runtime_constraints.allow_imports 扩展白名单 + 策略包自导入放行）
         allowed_modules = set()
         if internal_pack.runtime_constraints:
             allowed_modules = set(internal_pack.runtime_constraints.get("allow_imports", []))
 
-        # 创建带自定义白名单的沙箱进行检查
-        check_sandbox = Sandbox(allowed_modules=allowed_modules) if allowed_modules else self._sandbox
+        # 创建带自定义白名单和策略包自导入放行的沙箱进行检查
+        check_sandbox = Sandbox(
+            allowed_modules=allowed_modules if allowed_modules else None,
+            strategy_package=internal_pack.strategy_id,
+        )
         sandbox_result = check_sandbox.check(internal_pack.code_content)
         if not sandbox_result.passed:
             raise DataError(

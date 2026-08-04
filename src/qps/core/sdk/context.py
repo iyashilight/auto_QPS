@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, MutableMapping
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, MutableMapping
 
 if TYPE_CHECKING:
     from qps.core.models.account import Position
@@ -161,9 +164,13 @@ class StrategyContext:
     # ── 参数访问 ──────────────────────────────────────────
 
     @property
-    def params(self) -> dict[str, Any]:
-        """当前部署的参数快照（不可变）"""
-        return self._params
+    def params(self) -> MappingProxyType[str, Any]:
+        """当前部署的参数快照（不可变）
+
+        返回 MappingProxyType，修改会抛 TypeError。
+        策略侧 ctx.params.get(...) 仍可用（MappingProxyType 兼容 Mapping 接口）。
+        """
+        return MappingProxyType(self._params)
 
     @property
     def strategy_id(self) -> str:
@@ -281,9 +288,12 @@ class StrategyContext:
         self._positions = positions
 
     @property
-    def positions(self) -> list[PositionView]:
-        """当前部署相关持仓（只读）"""
-        return self._positions
+    def positions(self) -> tuple[PositionView, ...]:
+        """当前部署相关持仓（只读）
+
+        返回 tuple，修改不影响内部状态。
+        """
+        return tuple(self._positions)
 
     def set_cash(self, cash: Decimal) -> None:
         """设置可用资金（由框架调用）"""

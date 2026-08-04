@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from qps.core.errors import ConfigError
 from qps.research.metadata import StrategyMetadata

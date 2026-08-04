@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from qps.research.scaffold import TEMPLATES, StrategyScaffold
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestTemplates:
@@ -186,3 +189,40 @@ class TestGeneratedTestsRun:
         content = test_file.read_text()
         assert "test_initialize" in content
         assert "test_on_bar" in content
+
+
+class TestScaffoldSandboxCheck:
+    """三模板生成物整包沙箱检查测试"""
+
+    def test_trend_package_sandbox_pass(self, tmp_path: Path) -> None:
+        """趋势策略整包通过沙箱检查（含 __init__.py）"""
+        from qps.core.sandbox import Sandbox
+
+        scaffold = StrategyScaffold(tmp_path)
+        strategy_dir = scaffold.create("test_trend", template="trend")
+
+        sandbox = Sandbox(strategy_package="test_trend")
+        result = sandbox.check_directory(strategy_dir)
+        assert result.passed, f"沙箱检查失败: {[v.message for v in result.violations]}"
+
+    def test_mean_reversion_package_sandbox_pass(self, tmp_path: Path) -> None:
+        """均值回归策略整包通过沙箱检查（含 __init__.py）"""
+        from qps.core.sandbox import Sandbox
+
+        scaffold = StrategyScaffold(tmp_path)
+        strategy_dir = scaffold.create("test_mean_rev", template="mean_reversion")
+
+        sandbox = Sandbox(strategy_package="test_mean_rev")
+        result = sandbox.check_directory(strategy_dir)
+        assert result.passed, f"沙箱检查失败: {[v.message for v in result.violations]}"
+
+    def test_grid_package_sandbox_pass(self, tmp_path: Path) -> None:
+        """网格策略整包通过沙箱检查（含 __init__.py）"""
+        from qps.core.sandbox import Sandbox
+
+        scaffold = StrategyScaffold(tmp_path)
+        strategy_dir = scaffold.create("test_grid", template="grid")
+
+        sandbox = Sandbox(strategy_package="test_grid")
+        result = sandbox.check_directory(strategy_dir)
+        assert result.passed, f"沙箱检查失败: {[v.message for v in result.violations]}"

@@ -9,8 +9,10 @@ import ast
 import importlib.util
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @dataclass
@@ -120,9 +122,21 @@ FORBIDDEN_FUNCTIONS = {
 class ImportChecker(ast.NodeVisitor):
     """Import 检查器"""
 
-    def __init__(self, result: SandboxResult, allowed_modules: set[str]) -> None:
+    def __init__(
+        self,
+        result: SandboxResult,
+        allowed_modules: set[str],
+        strategy_package: str | None = None,
+    ) -> None:
         self.result = result
         self.allowed_modules = allowed_modules
+        self.strategy_package = strategy_package
+
+    def _is_strategy_package_import(self, module_name: str) -> bool:
+        """判断是否为策略包自身模块的导入"""
+        if self.strategy_package is None:
+            return False
+        return module_name == self.strategy_package or module_name.startswith(f"{self.strategy_package}.")
 
     def visit_Import(self, node: ast.Import) -> None:
         """检查 import 语句"""
@@ -135,6 +149,9 @@ class ImportChecker(ast.NodeVisitor):
                     line=node.lineno,
                     column=node.col_offset,
                 ))
+            elif self._is_strategy_package_import(alias.name):
+                # 策略包自身模块放行
+                pass
             elif module_name not in self.allowed_modules and not alias.name.startswith("qps.core"):
                 # 非白名单且非 qps.core 子模块
                 self.result.add_violation(SandboxViolation(
@@ -157,6 +174,9 @@ class ImportChecker(ast.NodeVisitor):
                     line=node.lineno,
                     column=node.col_offset,
                 ))
+            elif self._is_strategy_package_import(node.module):
+                # 策略包自身模块放行
+                pass
             elif module_name not in self.allowed_modules and not node.module.startswith("qps.core"):
                 self.result.add_violation(SandboxViolation(
                     rule_id="UNAUTHORIZED_IMPORT",
@@ -253,12 +273,17 @@ class MetaPathChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def check_code(source: str, allowed_modules: set[str] | None = None) -> SandboxResult:
+def check_code(
+    source: str,
+    allowed_modules: set[str] | None = None,
+    strategy_package: str | None = None,
+) -> SandboxResult:
     """检查源代码
 
     Args:
         source: Python 源代码字符串
         allowed_modules: 额外允许的模块集合
+        strategy_package: 策略包名（如 'demo_mean_reversion'），该包及其子模块导入放行
 
     Returns:
         检查结果
@@ -281,7 +306,7 @@ def check_code(source: str, allowed_modules: set[str] | None = None) -> SandboxR
         return result
 
     # 运行所有检查器
-    ImportChecker(result, merged_allowed).visit(tree)
+    ImportChecker(result, merged_allowed, strategy_package=strategy_package).visit(tree)
     CallChecker(result).visit(tree)
     NameChecker(result).visit(tree)
     FileAccessChecker(result).visit(tree)
@@ -290,12 +315,17 @@ def check_code(source: str, allowed_modules: set[str] | None = None) -> SandboxR
     return result
 
 
-def check_file(file_path: Path, allowed_modules: set[str] | None = None) -> SandboxResult:
+def check_file(
+    file_path: Path,
+    allowed_modules: set[str] | None = None,
+    strategy_package: str | None = None,
+) -> SandboxResult:
     """检查文件
 
     Args:
         file_path: Python 文件路径
         allowed_modules: 额外允许的模块集合
+        strategy_package: 策略包名，该包及其子模块导入放行
 
     Returns:
         检查结果
@@ -310,15 +340,20 @@ def check_file(file_path: Path, allowed_modules: set[str] | None = None) -> Sand
         ))
         return result
 
-    return check_code(source, allowed_modules)
+    return check_code(source, allowed_modules, strategy_package=strategy_package)
 
 
-def check_directory(dir_path: Path, allowed_modules: set[str] | None = None) -> SandboxResult:
+def check_directory(
+    dir_path: Path,
+    allowed_modules: set[str] | None = None,
+    strategy_package: str | None = None,
+) -> SandboxResult:
     """检查目录下所有 Python 文件
 
     Args:
         dir_path: 目录路径
         allowed_modules: 额外允许的模块集合
+        strategy_package: 策略包名，该包及其子模块导入放行
 
     Returns:
         检查结果（汇总所有文件）
@@ -329,7 +364,7 @@ def check_directory(dir_path: Path, allowed_modules: set[str] | None = None) -> 
         if py_file.name.startswith("test_"):
             # 测试文件跳过检查
             continue
-        result = check_file(py_file, allowed_modules)
+        result = check_file(py_file, allowed_modules, strategy_package=strategy_package)
         all_results.append(result)
 
     # 合并结果
@@ -348,15 +383,21 @@ class Sandbox:
     用于在受限环境中加载和执行策略代码。
     """
 
-    def __init__(self, allowed_modules: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        allowed_modules: set[str] | None = None,
+        strategy_package: str | None = None,
+    ) -> None:
         """初始化沙箱
 
         Args:
             allowed_modules: 额外允许的模块集合
+            strategy_package: 策略包名，该包及其子模块导入放行
         """
         self._allowed_modules = ALLOWED_MODULES.copy()
         if allowed_modules:
             self._allowed_modules.update(allowed_modules)
+        self._strategy_package = strategy_package
 
     def check(self, source: str) -> SandboxResult:
         """检查源代码
@@ -367,7 +408,7 @@ class Sandbox:
         Returns:
             检查结果
         """
-        return check_code(source, self._allowed_modules)
+        return check_code(source, self._allowed_modules, strategy_package=self._strategy_package)
 
     def check_file(self, file_path: Path) -> SandboxResult:
         """检查文件
@@ -378,7 +419,7 @@ class Sandbox:
         Returns:
             检查结果
         """
-        return check_file(file_path, self._allowed_modules)
+        return check_file(file_path, self._allowed_modules, strategy_package=self._strategy_package)
 
     def check_directory(self, dir_path: Path) -> SandboxResult:
         """检查目录
@@ -389,7 +430,7 @@ class Sandbox:
         Returns:
             检查结果
         """
-        return check_directory(dir_path, self._allowed_modules)
+        return check_directory(dir_path, self._allowed_modules, strategy_package=self._strategy_package)
 
     def load_module(self, name: str, path: Path) -> Any:
         """加载模块（受限制）

@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from qps.core.sandbox import (
     Sandbox,
     check_code,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestForbiddenImports:
@@ -207,3 +210,73 @@ class TestSandboxClass:
         result = sandbox.check_directory(tmp_path)
         assert not result.passed
         assert len(result.violations) >= 1
+
+
+class TestStrategyPackageSelfImport:
+    """策略包自导入放行测试"""
+
+    def test_strategy_package_import_allowed(self) -> None:
+        """策略包自身 import 放行"""
+        source = "import demo_mean_reversion"
+        result = check_code(source, strategy_package="demo_mean_reversion")
+        assert result.passed
+
+    def test_strategy_package_from_import_allowed(self) -> None:
+        """from <strategy_package>.xxx import 放行"""
+        source = "from demo_mean_reversion.strategy import Strategy"
+        result = check_code(source, strategy_package="demo_mean_reversion")
+        assert result.passed
+
+    def test_strategy_package_init_import_allowed(self) -> None:
+        """策略包 __init__.py 中的自导入放行"""
+        source = """\"\"\"演示均值回归策略\"\"\"
+
+from demo_mean_reversion.strategy import Strategy
+
+__all__ = ["Strategy"]
+"""
+        result = check_code(source, strategy_package="demo_mean_reversion")
+        assert result.passed
+
+    def test_strategy_package_submodule_import_allowed(self) -> None:
+        """策略包子模块 import 放行"""
+        source = "from demo_mean_reversion.features import compute_returns"
+        result = check_code(source, strategy_package="demo_mean_reversion")
+        assert result.passed
+
+    def test_non_strategy_package_import_still_blocked(self) -> None:
+        """非策略包的未授权 import 仍然被拦截"""
+        source = "import some_other_package"
+        result = check_code(source, strategy_package="demo_mean_reversion")
+        assert not result.passed
+        assert any(v.rule_id == "UNAUTHORIZED_IMPORT" for v in result.violations)
+
+    def test_strategy_package_does_not_override_forbidden(self) -> None:
+        """策略包放行不影响禁止模块拦截"""
+        source = "import socket"
+        result = check_code(source, strategy_package="socket")
+        # 即使 strategy_package 名与禁止模块同名，禁止模块仍优先拦截
+        assert not result.passed
+        assert any(v.rule_id == "FORBIDDEN_IMPORT" for v in result.violations)
+
+    def test_sandbox_class_with_strategy_package(self) -> None:
+        """Sandbox 类 strategy_package 参数生效"""
+        sandbox = Sandbox(strategy_package="my_strategy")
+        result = sandbox.check("from my_strategy.strategy import Strategy")
+        assert result.passed
+
+    def test_check_directory_with_strategy_package(self, tmp_path: Path) -> None:
+        """check_directory 传入 strategy_package 整包通过"""
+        # 创建策略包目录结构
+        pkg_dir = tmp_path / "my_strategy"
+        pkg_dir.mkdir()
+        (pkg_dir / "__init__.py").write_text(
+            "from my_strategy.strategy import Strategy\n__all__ = ['Strategy']\n"
+        )
+        (pkg_dir / "strategy.py").write_text(
+            "from __future__ import annotations\nfrom qps.core.sdk import BaseStrategy\n\nclass Strategy(BaseStrategy):\n    pass\n"
+        )
+
+        sandbox = Sandbox(strategy_package="my_strategy")
+        result = sandbox.check_directory(pkg_dir)
+        assert result.passed

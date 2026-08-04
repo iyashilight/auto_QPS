@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from qps.core.constants import (
     Action,

@@ -573,8 +573,9 @@ def strategy_create(
     instruments: str | None = typer.Option(None, "--instruments", help="标的列表，逗号分隔（如 BTC-USDT-PERP,ETH-USDT-PERP）"),
 ) -> None:
     """创建策略（脚手架生成 + 入库）"""
+    from qps.core.errors import DataError
     from qps.infra.config import Config
-    from qps.research.registry import StrategyCodePack, StrategyRegistry
+    from qps.research.registry import StrategyRegistry
     from qps.research.scaffold import StrategyScaffold
 
     # 验证模板
@@ -613,27 +614,27 @@ def strategy_create(
         import yaml as yaml_lib
         yaml_data = yaml_lib.safe_load(yaml_content)
 
-        code_pack = StrategyCodePack(
-            strategy_id=strategy_id,
-            code_ref=f"local:{strategy_id}",
-            code_content=code_content,
-            params_schema=yaml_data.get("params_schema", {}),
-            data_dependencies=[],
-            feature_dependencies=yaml_data.get("features", []),
-            runtime_constraints=yaml_data.get("runtime_constraints", {}),
-        )
+        code_pack_dict = {
+            "strategy_id": strategy_id,
+            "code_ref": f"local:{strategy_id}",
+            "code_content": code_content,
+            "params_schema": yaml_data.get("params_schema", {}),
+            "data_dependencies": [],
+            "feature_dependencies": yaml_data.get("features", []),
+            "runtime_constraints": yaml_data.get("runtime_constraints", {}),
+        }
 
         db_path = config.data_dir / "meta.db"
         registry = StrategyRegistry(db_path)
-        version_info = asyncio.run(registry.save_version(code_pack))
+        version_info = asyncio.run(registry.save_version(code_pack_dict))
 
-        typer.echo(f"   版本号: {version_info['version_no']}")
-        typer.echo(f"   内容哈希: {version_info['content_hash']}")
+        typer.echo(f"   版本号: {version_info.version_no}")
+        typer.echo(f"   内容哈希: {version_info.content_hash}")
         typer.echo("")
         typer.echo("下一步：")
         typer.echo(f"   1. 编辑 {strategy_dir}/strategy.py 实现策略逻辑")
         typer.echo(f"   2. 运行测试: pytest {strategy_dir}/tests/test_smoke.py")
-    except ValueError as e:
+    except (DataError, ValueError) as e:
         typer.echo(f"❌ 创建失败: {e}", err=True)
         raise typer.Exit(code=1) from e
 
@@ -649,10 +650,6 @@ def strategy_list(
     config = Config()
     db_path = config.data_dir / "meta.db"
 
-    if not db_path.exists():
-        typer.echo("⚠️  元数据库不存在，请先运行数据采集", err=True)
-        return
-
     registry = StrategyRegistry(db_path)
 
     try:
@@ -665,11 +662,11 @@ def strategy_list(
         typer.echo("📋 策略列表:")
         typer.echo("")
         for s in strategies:
-            typer.echo(f"  • {s['strategy_id']}")
-            typer.echo(f"    名称: {s['name']}")
-            typer.echo(f"    风格: {s['style']}")
-            typer.echo(f"    状态: {s['lifecycle_status']}")
-            typer.echo(f"    来源: {s['source']}")
+            typer.echo(f"  • {s.strategy_id}")
+            typer.echo(f"    名称: {s.name}")
+            typer.echo(f"    风格: {s.style.value}")
+            typer.echo(f"    状态: {s.lifecycle_status.value}")
+            typer.echo(f"    来源: {s.source.value}")
             typer.echo("")
 
     except Exception as e:
@@ -688,10 +685,6 @@ def strategy_status(
     config = Config()
     db_path = config.data_dir / "meta.db"
 
-    if not db_path.exists():
-        typer.echo("⚠️  元数据库不存在", err=True)
-        return
-
     registry = StrategyRegistry(db_path)
 
     try:
@@ -704,10 +697,10 @@ def strategy_status(
         typer.echo(f"📋 策略 {strategy_id} 版本历史:")
         typer.echo("")
         for v in versions:
-            typer.echo(f"  • 版本 {v['version_no']}")
-            typer.echo(f"    代码引用: {v['code_ref']}")
-            typer.echo(f"    内容哈希: {v['content_hash']}")
-            typer.echo(f"    创建时间: {v['created_at']}")
+            typer.echo(f"  • 版本 {v.version_no}")
+            typer.echo(f"    代码引用: {v.code_ref}")
+            typer.echo(f"    内容哈希: {v.content_hash}")
+            typer.echo(f"    创建时间: {v.created_at.isoformat()}")
             typer.echo("")
 
     except Exception as e:
