@@ -301,6 +301,31 @@ class FundingRateSource(StrEnum):
     FIXED = "FIXED"
 
 
+class AlphaTrend(StrEnum):
+    """Alpha Score 趋势"""
+
+    IMPROVING = "IMPROVING"
+    STABLE = "STABLE"
+    DECLINING = "DECLINING"
+
+
+class WeightAdjustment(StrEnum):
+    """推荐权重调整"""
+
+    INCREASE = "INCREASE"
+    MAINTAIN = "MAINTAIN"
+    REDUCE = "REDUCE"
+    PAUSE = "PAUSE"
+
+
+class FillTiming(StrEnum):
+    """撮合时点"""
+
+    BAR_CLOSE = "BAR_CLOSE"
+    NEXT_BAR_OPEN = "NEXT_BAR_OPEN"
+    BAR_AFTER_NEXT = "BAR_AFTER_NEXT"
+
+
 class AdapterConnectionStatus(StrEnum):
     """适配器连接状态"""
 

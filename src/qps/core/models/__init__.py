@@ -9,7 +9,7 @@
 - order.py: Order, Trade
 - account.py: Account, Position, Snapshot, StrategyAllocation, PortfolioRisk
 - risk.py: RiskRule, RiskCheckResult, RiskEvent
-- experiment.py: BacktestRun, OptimizationRun, ReportCard, Metrics
+- experiment.py: BacktestRun, OptimizationRun, ReportCard, Metrics, AlphaScore, CostConfig, BacktestRequest
 - task.py: TaskRun
 - audit.py: AuditLog
 - artifact.py: Artifact（M6 占位）
@@ -27,12 +27,20 @@ from qps.core.models.adapter import AdapterStatus
 from qps.core.models.artifact import Artifact
 from qps.core.models.audit import AuditLog
 from qps.core.models.experiment import (
+    AlphaScore,
+    BacktestRequest,
     BacktestRun,
+    ComparisonReport,
+    CostConfig,
     DataRange,
     GateResult,
     Metrics,
+    OptimizationRequest,
     OptimizationRun,
     ReportCard,
+    RunSummary,
+    WalkforwardConfigRequest,
+    build_backtest_request,
 )
 from qps.core.models.instrument import (
     CalendarBreak,
@@ -58,20 +66,18 @@ from qps.core.models.strategy import Deployment, Strategy, StrategyParams, Strat
 from qps.core.models.task import TaskRun
 
 __all__ = [
-    # account
     "Account",
-    # adapter
     "AdapterStatus",
-    # artifact
+    "AlphaScore",
     "Artifact",
-    # audit
     "AuditLog",
-    # experiment
+    "BacktestRequest",
     "BacktestRun",
     "Balance",
-    # market
     "Bar",
     "CalendarBreak",
+    "ComparisonReport",
+    "CostConfig",
     "DataRange",
     "Deployment",
     "ExchangeCalendar",
@@ -79,13 +85,12 @@ __all__ = [
     "FeatureSet",
     "FundingRate",
     "GateResult",
-    # instrument
     "Instrument",
     "MarkPrice",
     "Metrics",
     "OpenInterest",
+    "OptimizationRequest",
     "OptimizationRun",
-    # order
     "Order",
     "OrderBookLevel",
     "OrderBookSnapshot",
@@ -94,20 +99,19 @@ __all__ = [
     "ReportCard",
     "RiskCheckResult",
     "RiskEvent",
-    # risk
     "RiskRule",
     "RuleCheckResult",
+    "RunSummary",
     "Snapshot",
-    # strategy
     "Strategy",
     "StrategyAllocation",
     "StrategyParams",
     "StrategyVersion",
     "SymbolMapping",
-    # task
     "TaskRun",
     "Tick",
     "Trade",
-    # intent
     "TradingIntent",
+    "WalkforwardConfigRequest",
+    "build_backtest_request",
 ]

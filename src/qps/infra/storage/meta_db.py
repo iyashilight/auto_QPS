@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS report_cards (
     version_no    INTEGER NOT NULL,
     metrics       TEXT NOT NULL,
     gate_results  TEXT NOT NULL,
+    alpha_score   TEXT,
     conclusion    TEXT
 );
 

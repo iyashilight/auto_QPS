@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -92,6 +93,9 @@ class BacktestCostConfig(BaseModel):
     margin_mode: str = Field(default="ISOLATED", description="保证金模式")
     liquidation_margin_rate: Decimal = Field(
         default=Decimal("0.005"), description="强平保证金率"
+    )
+    use_depth_snapshots: bool = Field(
+        default=False, description="是否使用订单簿深度快照（DEPTH 滑点模型需要）"
     )
 
 
@@ -287,6 +291,38 @@ class AppConfig(BaseModel):
     alerts: AlertsConfig = Field(default_factory=AlertsConfig, description="告警配置")
 
 
+def _normalize_config_case(raw: dict[str, Any]) -> dict[str, Any]:
+    """将 YAML 小写枚举值规范化为大写（与 Pydantic Literal 对齐）
+
+    YAML 人类可读用小写（event_driven, fixed, real, grid），
+    Pydantic Literal 用大写（EVENT_DRIVEN, FIXED, REAL, GRID）。
+    此函数在 validate_config 之前调用，保证兼容。
+    """
+    result = copy.deepcopy(raw)
+
+    # backtest.default_mode
+    bt = result.get("backtest", {})
+    if isinstance(bt, dict):
+        mode = bt.get("default_mode")
+        if isinstance(mode, str):
+            bt["default_mode"] = mode.upper()
+        costs = bt.get("costs", {})
+        if isinstance(costs, dict):
+            for key in ("slippage_model", "funding_rate_source"):
+                val = costs.get(key)
+                if isinstance(val, str):
+                    costs[key] = val.upper()
+
+    # optimizer.algorithm
+    opt = result.get("optimizer", {})
+    if isinstance(opt, dict):
+        algo = opt.get("algorithm")
+        if isinstance(algo, str):
+            opt["algorithm"] = algo.upper()
+
+    return result
+
+
 def validate_config(raw: dict[str, Any]) -> AppConfig:
     """校验原始配置字典并返回类型化 AppConfig
 
@@ -300,6 +336,7 @@ def validate_config(raw: dict[str, Any]) -> AppConfig:
         ConfigError: 配置校验失败时
     """
     try:
-        return AppConfig.model_validate(raw)
+        normalized = _normalize_config_case(raw)
+        return AppConfig.model_validate(normalized)
     except Exception as e:
         raise ConfigError(detail=f"配置校验失败: {e}", cause=e) from e

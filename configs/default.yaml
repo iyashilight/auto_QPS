@@ -36,6 +36,7 @@ backtest:
     leverage: 3
     margin_mode: ISOLATED
     liquidation_margin_rate: 0.005
+    use_depth_snapshots: false
   parallel_workers: 4
   random_seed: 42
 

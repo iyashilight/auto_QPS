@@ -477,6 +477,7 @@ CREATE TABLE report_cards (
     version_no    INTEGER NOT NULL,
     metrics       TEXT NOT NULL,            -- JSON, 字段见 Metrics
     gate_results  TEXT NOT NULL,            -- JSON
+    alpha_score   TEXT,                     -- JSON, AlphaScore 模型（M3 起）
     conclusion    TEXT
 );
 
