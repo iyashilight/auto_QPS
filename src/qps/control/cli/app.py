@@ -622,6 +622,8 @@ def strategy_create(
             "data_dependencies": [],
             "feature_dependencies": yaml_data.get("features", []),
             "runtime_constraints": yaml_data.get("runtime_constraints", {}),
+            "name": yaml_data.get("name", strategy_id),
+            "style": yaml_data.get("style", "OTHER"),
         }
 
         db_path = config.data_dir / "meta.db"

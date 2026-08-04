@@ -38,7 +38,7 @@ params_schema:
       step: 0.01
       description: 仓位大小
 
-features: ["returns", "realized_vol_20"]
+features: ["returns", "mean_return_20", "realized_vol_20"]
 
 runtime_constraints:
   allow_network: false

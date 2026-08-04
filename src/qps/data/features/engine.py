@@ -720,6 +720,27 @@ def feature_realized_volatility(bars: list[Bar], params: dict[str, Any]) -> np.n
     return rv
 
 
+def feature_mean_return(bars: list[Bar], params: dict[str, Any]) -> np.ndarray:
+    """N 期对数收益率均值
+
+    Args:
+        bars: K 线数据
+        params: {"period": N}（默认 20）
+
+    Returns:
+        均值数组
+    """
+    period = params.get("period", 20)
+    returns = feature_returns(bars, {})
+    mean_ret = np.full(len(returns), np.nan)
+    for i in range(period, len(returns)):
+        window = returns[i - period + 1: i + 1]
+        valid = window[~np.isnan(window)]
+        if len(valid) >= 2:
+            mean_ret[i] = np.mean(valid)
+    return mean_ret
+
+
 def feature_volume_change(bars: list[Bar], params: dict[str, Any]) -> np.ndarray:
     """成交量变化率
 
@@ -838,6 +859,7 @@ def register_mvp_features(engine: FeatureEngine) -> None:
     - momentum_10: 10 期动量
     - atr_14: 14 期 ATR
     - realized_vol_20: 20 期已实现波动率
+    - mean_return_20: 20 期对数收益率均值
     - volume_change: 成交量变化率
     - funding_rate_stats: 资金费率统计
     - oi_change: 持仓量变化率
@@ -866,6 +888,12 @@ def register_mvp_features(engine: FeatureEngine) -> None:
         func=feature_realized_volatility,
         input_window=21,
         params={"period": 20, "annualize": True},
+    )
+    engine.register_feature(
+        name="mean_return_20",
+        func=feature_mean_return,
+        input_window=21,
+        params={"period": 20},
     )
     engine.register_feature(
         name="volume_change",

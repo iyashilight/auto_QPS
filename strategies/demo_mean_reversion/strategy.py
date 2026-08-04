@@ -1,7 +1,7 @@
 """演示均值回归策略
 
 策略逻辑：
-- 从 Feature Pipeline 读取 returns / realized_vol_20 特征
+- 从 Feature Pipeline 读取 returns / mean_return_20 / realized_vol_20 特征
 - 计算 Z-Score = (当前收益率 - 均值) / 标准差
 - 当 |Z-Score| >= entry_z 时入场
 - 当 Z-Score 回归到 exit_z 内时出场
@@ -48,25 +48,26 @@ class Strategy(BaseStrategy):
 
         # ── 从 Feature Pipeline 读取特征 ──────────────────────────────────
         returns = ctx.feature(instrument_id, "returns")
+        mean_return = ctx.feature(instrument_id, "mean_return_20")
         realized_vol = ctx.feature(instrument_id, "realized_vol_20")
 
         # 特征缓存未命中：跳过本轮信号
-        if returns is None or realized_vol is None:
+        if returns is None or mean_return is None or realized_vol is None:
             ctx.log("DEBUG", "特征缓存未命中，跳过本轮信号",
                      feature_missing=["returns" if returns is None else "",
+                                     "mean_return_20" if mean_return is None else "",
                                      "realized_vol_20" if realized_vol is None else ""])
             return
 
         # ── 计算 Z-Score ──────────────────────────────────────────────────
-        # 使用 Feature Pipeline 提供的收益率序列和波动率
-        # returns 是最近一根 K 线的收益率
-        # realized_vol_20 是过去 20 根 K 线的年化波动率
-        current_return = returns
-        volatility = realized_vol
-
-        # 简化处理：假设 returns 已经是偏离均值的量
-        # 实际实现中，Feature Pipeline 应提供完整的统计量
-        z_score = current_return / volatility if volatility > 0 else 0
+        # 使用 Feature Pipeline 提供的完整统计量
+        # returns: 当前对数收益率
+        # mean_return_20: 过去 20 期对数收益率均值
+        # realized_vol_20: 过去 20 期年化波动率（需去年化）
+        # 5m K 线年化因子 = 105120，去年化 = vol / sqrt(105120)
+        annualization_factor = 105120  # 5m 间隔
+        std_return = realized_vol / (annualization_factor ** 0.5)
+        z_score = (returns - mean_return) / std_return if std_return > 0 else 0
 
         # 检查持仓状态
         position_side = ctx.state.get("position_side")
@@ -86,8 +87,9 @@ class Strategy(BaseStrategy):
 
         # 更新状态
         ctx.state["last_z_score"] = z_score
-        ctx.state["last_return"] = current_return
-        ctx.state["last_volatility"] = volatility
+        ctx.state["last_return"] = returns
+        ctx.state["last_mean_return"] = mean_return
+        ctx.state["last_volatility"] = realized_vol
 
     def _calculate_returns(self, bars: list[Bar]) -> list[float]:
         """计算收益率序列（备用方法，不直接使用）

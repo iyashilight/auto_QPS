@@ -32,6 +32,8 @@ class StrategyCodePack:
         runtime_constraints: dict[str, Any] | None = None,
         asset_class_support: list[AssetClass] | None = None,
         source: StrategySource = StrategySource.MANUAL,
+        name: str | None = None,
+        style: str | None = None,
     ) -> None:
         """初始化代码包
 
@@ -45,6 +47,8 @@ class StrategyCodePack:
             runtime_constraints: 运行时约束
             asset_class_support: 资产类别支持
             source: 来源
+            name: 策略显示名（来自 strategy.yaml）
+            style: 策略风格（来自 strategy.yaml，如 MEAN_REVERSION）
         """
         self.strategy_id = strategy_id
         self.code_ref = code_ref
@@ -55,6 +59,8 @@ class StrategyCodePack:
         self.runtime_constraints = runtime_constraints or {}
         self.asset_class_support = asset_class_support or [AssetClass.PERPETUAL]
         self.source = source
+        self.name = name or strategy_id
+        self.style = style or "OTHER"
 
         # 计算 content_hash
         self.content_hash = self._compute_hash()
@@ -167,6 +173,8 @@ class StrategyRegistry:
             data_dependencies=code_pack.get("data_dependencies", []),
             feature_dependencies=code_pack.get("feature_dependencies", []),
             runtime_constraints=code_pack.get("runtime_constraints", {}),
+            name=code_pack.get("name"),
+            style=code_pack.get("style"),
         )
 
         # 1. 检查是否已存在相同 content_hash
@@ -198,8 +206,12 @@ class StrategyRegistry:
         except Exception as e:
             raise DataError(detail=f"params_schema 校验失败: {e}") from e
 
-        # 4. 获取或创建策略主记录
-        self._ensure_strategy(internal_pack.strategy_id)
+        # 4. 获取或创建策略主记录（传入 strategy.yaml 的 name/style）
+        self._ensure_strategy(
+            internal_pack.strategy_id,
+            name=internal_pack.name,
+            style=internal_pack.style,
+        )
 
         # 5. 获取下一个版本号
         version_no = self._next_version_no(internal_pack.strategy_id)
@@ -376,8 +388,19 @@ class StrategyRegistry:
         finally:
             conn.close()
 
-    def _ensure_strategy(self, strategy_id: str) -> None:
-        """确保策略主记录存在"""
+    def _ensure_strategy(
+        self,
+        strategy_id: str,
+        name: str | None = None,
+        style: str | None = None,
+    ) -> None:
+        """确保策略主记录存在
+
+        Args:
+            strategy_id: 策略 ID
+            name: 策略显示名（来自 strategy.yaml，默认用 strategy_id）
+            style: 策略风格（来自 strategy.yaml，默认 OTHER）
+        """
         conn = self._get_connection()
         try:
             row = conn.execute(
@@ -392,7 +415,7 @@ class StrategyRegistry:
                        (strategy_id, name, description, style, lifecycle_status,
                         tags, account_binding, source, created_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (strategy_id, strategy_id, "", "OTHER", "DRAFT",
+                    (strategy_id, name or strategy_id, "", style or "OTHER", "DRAFT",
                      "[]", None, "MANUAL", now, now),
                 )
                 conn.commit()

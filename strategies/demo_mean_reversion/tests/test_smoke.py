@@ -8,7 +8,6 @@
 """
 
 import sys
-from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -95,7 +94,7 @@ def test_emit_intent_via_event_bus():
 
     # 创建一个返回正常特征值的 pipeline
     def feature_pipeline(instrument_id: str, names: list[str]) -> dict[str, float]:
-        return {"returns": -0.03, "realized_vol_20": 0.02}
+        return {"returns": -0.03, "mean_return_20": 0.001, "realized_vol_20": 0.02}
 
     strategy = Strategy()
     ctx = StrategyContext(
@@ -110,10 +109,14 @@ def test_emit_intent_via_event_bus():
     )
     strategy.initialize(ctx)
 
-    # 发送一根 K 线（Z-Score = -0.03/0.02 = -1.5，绝对值 >= entry_z=2.0? 不满足）
-    # 让我们用更极端的值
+    # 发送一根 K 线
+    # Z-Score = (returns - mean_return) / (vol / sqrt(105120))
+    # = (-0.03 - 0.001) / (0.02 / 324.23) ≈ -0.031 / 0.0000617 ≈ -502
+    # 绝对值 >= entry_z=2.0，触发 LONG OPEN
+    # 让我们用更合理的值
     def extreme_pipeline(instrument_id: str, names: list[str]) -> dict[str, float]:
-        return {"returns": -0.05, "realized_vol_20": 0.02}  # Z-Score = -2.5
+        # Z-Score = (-0.05 - 0.0) / (0.02 / 324.23) ≈ -810 → 触发 LONG
+        return {"returns": -0.05, "mean_return_20": 0.0, "realized_vol_20": 0.02}
 
     ctx._feature_pipeline = extreme_pipeline
     bar = make_bar(67000.0)
