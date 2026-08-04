@@ -174,10 +174,26 @@ def build_container(config: Config) -> Container:
 
     data_provider = DataProvider(config.data_dir)
     container.register_port("data_provider", data_provider)
+
+    # ── M3: Backtest Engine & Optimizer & Experiment Store ──
+    from qps.research.backtest.event_driven import EventDrivenBacktestEngine
+    from qps.research.experiments import ExperimentStore
+    from qps.research.optimizer.engine import Optimizer
+
+    backtest_engine = EventDrivenBacktestEngine(container)
+    container.register_port("backtest_engine", backtest_engine)
+
+    experiment_store = ExperimentStore(
+        meta_db=container.meta_db,
+        data_dir=config.data_dir,
+    )
+    container.register_port("experiment_store", experiment_store)
+
+    optimizer = Optimizer(container)
+    container.register_port("optimizer", optimizer)
+
     _port_names = [
         "broker_adapter",
-        "backtest_engine",
-        "optimizer",
         "strategy_registry",
         "lifecycle_manager",
         "signal_engine",
@@ -185,7 +201,6 @@ def build_container(config: Config) -> Container:
         "risk_engine",
         "execution_engine",
         "strategy_runtime",
-        "experiment_store",
         "monitoring",
         "scheduler",
         "agent_gateway",

@@ -507,32 +507,199 @@ def research_backtest(
     strategy_id: str = typer.Argument(help="策略 ID"),
     version: int | None = typer.Option(None, "--version", "-v", help="策略版本"),
     params: str | None = typer.Option(None, "--params", help="参数 JSON"),
-    mode: str = typer.Option("event_driven", "--mode", "-m", help="回测模式"),
+    mode: str = typer.Option("event_driven", "--mode", "-m", help="回测模式 (vectorized/event_driven)"),
     interval: str = typer.Option("5m", "--interval", "-i", help="K 线间隔"),
-    range_str: str | None = typer.Option(None, "--range", help="时间范围 START:END"),
+    range_str: str | None = typer.Option(None, "--range", help="时间范围 START:END (ISO 8601)"),
+    instruments: str | None = typer.Option(None, "--instruments", help="标的列表，逗号分隔"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """策略回测"""
-    _not_implemented("research backtest")
+    from qps.di import build_container
+    from qps.infra.config import Config
+
+    # 解析参数
+    params_dict: dict[str, Any] = {}
+    if params:
+        try:
+            params_dict = json.loads(params)
+        except json.JSONDecodeError as e:
+            typer.echo(f"❌ 参数 JSON 格式错误: {e}", err=True)
+            raise typer.Exit(code=2) from e
+
+    # 解析时间范围
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 12, 31, tzinfo=UTC)
+    if range_str:
+        parts = range_str.split(":")
+        if len(parts) != 2:
+            typer.echo("❌ --range 格式: START:END (ISO 8601)", err=True)
+            raise typer.Exit(code=2)
+        try:
+            start = datetime.fromisoformat(parts[0]).replace(tzinfo=UTC) if parts[0] else start
+            end = datetime.fromisoformat(parts[1]).replace(tzinfo=UTC) if parts[1] else end
+        except ValueError as e:
+            typer.echo(f"❌ 日期格式错误: {e}", err=True)
+            raise typer.Exit(code=2) from e
+
+    # 解析标的列表
+    instrument_list = ["binance-btc-usdt-perp"]
+    if instruments:
+        instrument_list = [_make_instrument_id(i.strip()) for i in instruments.split(",")]
+
+    # 验证模式
+    if mode not in ("vectorized", "event_driven"):
+        typer.echo(f"❌ 不支持的回测模式: {mode}，支持: vectorized/event_driven", err=True)
+        raise typer.Exit(code=2)
+
+    # 构建请求
+    request: dict[str, Any] = {
+        "strategy_id": strategy_id,
+        "version_no": version or 1,
+        "params": params_dict,
+        "instruments": instrument_list,
+        "interval": interval,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "engine_mode": mode.upper(),
+        "data_version": "unknown",
+        "feature_version": "unknown",
+    }
+
+    async def _run() -> None:
+        config = Config()
+        container = build_container(config)
+
+        # 选择引擎
+        if mode == "vectorized":
+            from qps.research.backtest.vectorized import VectorizedBacktestEngine
+            engine: VectorizedBacktestEngine | EventDrivenBacktestEngine = VectorizedBacktestEngine(container)
+        else:
+            from qps.research.backtest.event_driven import EventDrivenBacktestEngine
+            engine = EventDrivenBacktestEngine(container)
+
+        result = await engine.run(request)
+
+        if json_output:
+            output = result.model_dump(mode="json")
+            typer.echo(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        else:
+            if result.status.value == "SUCCEEDED" and result.metrics:
+                m = result.metrics
+                typer.echo(f"✅ 回测完成: {result.run_id}")
+                typer.echo(f"   策略: {result.strategy_id} v{result.version_no}")
+                typer.echo(f"   总收益: {m.total_return:.4%}")
+                typer.echo(f"   年化收益: {m.annualized_return:.4%}")
+                typer.echo(f"   最大回撤: {m.max_drawdown:.4%}")
+                typer.echo(f"   夏普比率: {m.sharpe:.4f}")
+                typer.echo(f"   胜率: {m.win_rate:.4%}")
+                typer.echo(f"   交易次数: {m.trade_count}")
+                if m.funding_pnl is not None:
+                    typer.echo(f"   资金费率盈亏: {m.funding_pnl}")
+                if m.liquidation_count is not None:
+                    typer.echo(f"   强平次数: {m.liquidation_count}")
+            else:
+                typer.echo(f"❌ 回测失败: {result.run_id}")
+                if result.engine_config.get("error"):
+                    typer.echo(f"   错误: {result.engine_config['error']}", err=True)
+
+    asyncio.run(_run())
 
 
 @research_app.command("optimize")
 def research_optimize(
     strategy_id: str = typer.Argument(help="策略 ID"),
-    algorithm: str = typer.Option("grid", "--algorithm", "-a", help="搜索算法"),
+    algorithm: str = typer.Option("grid", "--algorithm", "-a", help="搜索算法 (grid/random/bayesian)"),
     budget: int = typer.Option(1000, "--budget", "-b", help="搜索预算"),
     objective: str | None = typer.Option(None, "--objective", help="目标函数 JSON"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """参数优化"""
-    _not_implemented("research optimize")
+    from qps.di import build_container
+    from qps.infra.config import Config
+    from qps.research.optimizer.engine import Optimizer
+
+    # 解析目标函数
+    objective_dict: dict[str, Any] = {}
+    if objective:
+        try:
+            objective_dict = json.loads(objective)
+        except json.JSONDecodeError as e:
+            typer.echo(f"❌ 目标函数 JSON 格式错误: {e}", err=True)
+            raise typer.Exit(code=2) from e
+
+    # 验证算法
+    valid_algorithms = ("grid", "random", "bayesian")
+    if algorithm not in valid_algorithms:
+        typer.echo(f"❌ 不支持的算法: {algorithm}，支持: {valid_algorithms}", err=True)
+        raise typer.Exit(code=2)
+
+    request: dict[str, Any] = {
+        "strategy_id": strategy_id,
+        "algorithm": algorithm.upper(),
+        "budget": budget,
+        "objective": objective_dict,
+    }
+
+    async def _run() -> None:
+        config = Config()
+        container = build_container(config)
+        optimizer = Optimizer(container)
+
+        result = await optimizer.search(request)
+
+        if json_output:
+            output = result.model_dump(mode="json")
+            typer.echo(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        else:
+            if result.status.value == "SUCCEEDED":
+                typer.echo(f"✅ 优化完成: {result.run_id}")
+                if result.best_params:
+                    typer.echo(f"   最优参数: {json.dumps(result.best_params, ensure_ascii=False)}")
+                if result.best_metrics:
+                    typer.echo(f"   最优夏普: {result.best_metrics.sharpe:.4f}")
+                typer.echo(f"   评估次数: {len(result.evaluations)}")
+            else:
+                typer.echo(f"❌ 优化失败: {result.run_id}")
+
+    asyncio.run(_run())
 
 
 @research_app.command("list-runs")
 def research_list_runs(
     strategy: str | None = typer.Option(None, "--strategy", "-s", help="按策略过滤"),
-    type_filter: str | None = typer.Option(None, "--type", "-t", help="按类型过滤"),
+    type_filter: str | None = typer.Option(None, "--type", "-t", help="按类型过滤 (BACKTEST/OPTIMIZATION)"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """列出回测/优化运行记录"""
-    _not_implemented("research list-runs")
+    from qps.di import build_container
+    from qps.infra.config import Config
+    from qps.research.experiments import ExperimentStore
+
+    async def _run() -> None:
+        config = Config()
+        container = build_container(config)
+        store = ExperimentStore(
+            meta_db=container.meta_db,
+            data_dir=config.data_dir,
+        )
+
+        summaries = await store.list_runs(
+            strategy_id=strategy,
+            run_type=type_filter,
+        )
+
+        if json_output:
+            output = [s.model_dump(mode="json") for s in summaries]
+            typer.echo(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        else:
+            if not summaries:
+                typer.echo("📋 无运行记录")
+                return
+            typer.echo(f"📋 运行记录 ({len(summaries)} 条):")
+            for s in summaries:
+                typer.echo(f"  • {s.run_id} [{s.run_type}] {s.strategy_id} v{s.version_no} — {s.status.value}")
+
+    asyncio.run(_run())
 
 
 # ── experiment 子命令 ────────────────────────────────────
@@ -541,25 +708,116 @@ def research_list_runs(
 @experiment_app.command("show")
 def experiment_show(
     run_id: str = typer.Argument(help="实验运行 ID"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """查看实验详情"""
-    _not_implemented("experiment show")
+    from qps.di import build_container
+    from qps.infra.config import Config
+    from qps.research.experiments import ExperimentStore
+
+    async def _run() -> None:
+        config = Config()
+        container = build_container(config)
+        store = ExperimentStore(
+            meta_db=container.meta_db,
+            data_dir=config.data_dir,
+        )
+
+        try:
+            run = await store.get_run(run_id)
+        except Exception as e:
+            typer.echo(f"❌ 查询失败: {e}", err=True)
+            raise typer.Exit(code=1) from e
+
+        if json_output:
+            output = run.model_dump(mode="json")
+            typer.echo(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        else:
+            typer.echo(f"📋 实验详情: {run.run_id}")
+            typer.echo(f"   策略: {run.strategy_id} v{run.version_no}")
+            typer.echo(f"   状态: {run.status.value}")
+            typer.echo(f"   创建时间: {run.created_at.isoformat()}")
+            if hasattr(run, "metrics") and run.metrics:
+                m = run.metrics
+                typer.echo(f"   总收益: {m.total_return:.4%}")
+                typer.echo(f"   夏普: {m.sharpe:.4f}")
+                typer.echo(f"   最大回撤: {m.max_drawdown:.4%}")
+
+    asyncio.run(_run())
 
 
 @experiment_app.command("compare")
 def experiment_compare(
     run_ids: list[str] = typer.Argument(help="实验运行 ID 列表"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
     """对比多个实验"""
-    _not_implemented("experiment compare")
+    from qps.di import build_container
+    from qps.infra.config import Config
+    from qps.research.experiments import ExperimentStore
+
+    async def _run() -> None:
+        config = Config()
+        container = build_container(config)
+        store = ExperimentStore(
+            meta_db=container.meta_db,
+            data_dir=config.data_dir,
+        )
+
+        try:
+            report = await store.compare(run_ids)
+        except Exception as e:
+            typer.echo(f"❌ 对比失败: {e}", err=True)
+            raise typer.Exit(code=1) from e
+
+        if json_output:
+            output = report.model_dump(mode="json")
+            typer.echo(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        else:
+            typer.echo(f"📊 实验对比 ({len(report.run_ids)} 个运行):")
+            typer.echo(f"   指标: {', '.join(report.metric_names)}")
+            for row in report.rows:
+                typer.echo(f"   {row.get('run_id', '?')}: " + ", ".join(
+                    f"{k}={v}" for k, v in row.items() if k != "run_id"
+                ))
+
+    asyncio.run(_run())
 
 
 @experiment_app.command("rerun")
 def experiment_rerun(
     run_id: str = typer.Argument(help="实验运行 ID"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
 ) -> None:
-    """重跑实验"""
-    _not_implemented("experiment rerun")
+    """重跑实验（确定性：结果必须与原始 run 一致）"""
+    from qps.di import build_container
+    from qps.infra.config import Config
+    from qps.research.backtest.event_driven import EventDrivenBacktestEngine
+
+    async def _run() -> None:
+        config = Config()
+        container = build_container(config)
+        engine = EventDrivenBacktestEngine(container)
+
+        try:
+            result = await engine.rerun(run_id)
+        except Exception as e:
+            typer.echo(f"❌ 重跑失败: {e}", err=True)
+            raise typer.Exit(code=1) from e
+
+        if json_output:
+            output = result.model_dump(mode="json")
+            typer.echo(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        else:
+            if result.status.value == "SUCCEEDED" and result.metrics:
+                m = result.metrics
+                typer.echo(f"✅ 重跑完成: {result.run_id}")
+                typer.echo(f"   总收益: {m.total_return:.4%}")
+                typer.echo(f"   夏普: {m.sharpe:.4f}")
+            else:
+                typer.echo(f"❌ 重跑失败: {result.run_id}")
+
+    asyncio.run(_run())
 
 
 # ── strategy 子命令 ──────────────────────────────────────
