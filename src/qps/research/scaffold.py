@@ -58,14 +58,40 @@ class Strategy(BaseStrategy):
 
     def initialize(self, ctx: StrategyContext) -> None:
         """初始化"""
-        self.lookback = ctx.params.get("lookback", 50)
-        self.atr_mult = ctx.params.get("atr_mult", 2.0)
-        self.position_size = ctx.params.get("position_size", 0.1)
+        ctx.state["position_side"] = None
+        ctx.state["position_size"] = str(ctx.params.get("position_size", 0.1))
 
     def on_bar(self, ctx: StrategyContext, bar: Bar) -> None:
         """K 线回调"""
-        # TODO: 实现趋势逻辑
-        pass
+        lookback = int(ctx.params.get("lookback", 50))
+        history = ctx.history(bar.instrument_id, lookback + 1)
+        if len(history) < lookback + 1:
+            return
+        previous = history[-lookback - 1:-1]
+        upper = max(item.high for item in previous)
+        lower = min(item.low for item in previous)
+        side = ctx.state.get("position_side")
+        quantity = ctx.state["position_size"]
+        if side is None and bar.close > upper:
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": "LONG",
+                             "action": "OPEN", "quantity": quantity, "order_type": "MARKET",
+                             "reason_tags": ["trend", "breakout_up"]})
+            ctx.state["position_side"] = "LONG"
+        elif side is None and bar.close < lower:
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": "SHORT",
+                             "action": "OPEN", "quantity": quantity, "order_type": "MARKET",
+                             "reason_tags": ["trend", "breakout_down"]})
+            ctx.state["position_side"] = "SHORT"
+        elif side == "LONG" and bar.close < lower:
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": "LONG",
+                             "action": "CLOSE", "quantity": quantity, "order_type": "MARKET",
+                             "reason_tags": ["trend", "breakout_reversal"]})
+            ctx.state["position_side"] = None
+        elif side == "SHORT" and bar.close > upper:
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": "SHORT",
+                             "action": "CLOSE", "quantity": quantity, "order_type": "MARKET",
+                             "reason_tags": ["trend", "breakout_reversal"]})
+            ctx.state["position_side"] = None
 ''',
     },
     "mean_reversion": {
@@ -121,15 +147,49 @@ class Strategy(BaseStrategy):
 
     def initialize(self, ctx: StrategyContext) -> None:
         """初始化"""
-        self.lookback = ctx.params.get("lookback", 50)
-        self.entry_z = ctx.params.get("entry_z", 2.0)
-        self.exit_z = ctx.params.get("exit_z", 0.5)
-        self.position_size = ctx.params.get("position_size", 0.1)
+        ctx.state["position_side"] = None
+        ctx.state["position_size"] = str(ctx.params.get("position_size", 0.1))
 
     def on_bar(self, ctx: StrategyContext, bar: Bar) -> None:
         """K 线回调"""
-        # TODO: 实现均值回归逻辑
-        pass
+        lookback = int(ctx.params.get("lookback", 50))
+        entry_z = float(ctx.params.get("entry_z", 2.0))
+        exit_z = float(ctx.params.get("exit_z", 0.5))
+        history = ctx.history(bar.instrument_id, lookback + 1)
+        if len(history) < lookback + 1:
+            return
+        returns = ctx.feature(bar.instrument_id, "returns")
+        volatility = ctx.feature(bar.instrument_id, "realized_vol_20")
+        if returns is None or volatility is None:
+            return
+        historical_returns = []
+        for previous, current in zip(history[-lookback - 1:-1], history[-lookback:]):
+            if previous.close <= 0:
+                return
+            historical_returns.append(float((current.close - previous.close) / previous.close))
+        if not historical_returns:
+            return
+        mean_return = sum(historical_returns) / len(historical_returns)
+        std_return = float(volatility) / (105120 ** 0.5)
+        z_score = (float(returns) - mean_return) / std_return if std_return > 0 else 0.0
+        side = ctx.state.get("position_side")
+        quantity = ctx.state["position_size"]
+        if side is None and abs(z_score) >= entry_z:
+            direction = "LONG" if z_score < 0 else "SHORT"
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": direction,
+                             "action": "OPEN", "quantity": quantity, "order_type": "MARKET",
+                             "reason_tags": ["mean_reversion", "z_score_entry"]})
+            ctx.state["position_side"] = direction
+        elif side == "LONG" and z_score >= exit_z:
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": "LONG",
+                             "action": "CLOSE", "quantity": quantity, "order_type": "MARKET",
+                             "reason_tags": ["mean_reversion", "z_score_exit"]})
+            ctx.state["position_side"] = None
+        elif side == "SHORT" and z_score <= -exit_z:
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": "SHORT",
+                             "action": "CLOSE", "quantity": quantity, "order_type": "MARKET",
+                             "reason_tags": ["mean_reversion", "z_score_exit"]})
+            ctx.state["position_side"] = None
 ''',
     },
     "grid": {
@@ -177,14 +237,40 @@ class Strategy(BaseStrategy):
 
     def initialize(self, ctx: StrategyContext) -> None:
         """初始化"""
-        self.grid_spacing = ctx.params.get("grid_spacing", 0.01)
-        self.grid_count = ctx.params.get("grid_count", 10)
-        self.position_size = ctx.params.get("position_size", 0.1)
+        ctx.state["grid_reference"] = None
+        ctx.state["position_side"] = None
+        ctx.state["position_size"] = str(ctx.params.get("position_size", 0.1))
 
     def on_bar(self, ctx: StrategyContext, bar: Bar) -> None:
         """K 线回调"""
-        # TODO: 实现网格逻辑
-        pass
+        from decimal import Decimal
+
+        spacing = Decimal(str(ctx.params.get("grid_spacing", 0.01)))
+        if spacing <= 0:
+            return
+        reference = ctx.state.get("grid_reference")
+        if reference is None:
+            ctx.state["grid_reference"] = str(bar.close)
+            return
+        reference_price = Decimal(str(reference))
+        move = (bar.close - reference_price) / reference_price if reference_price else Decimal("0")
+        if abs(move) < spacing:
+            return
+        side = ctx.state.get("position_side")
+        quantity = ctx.state["position_size"]
+        direction = "LONG" if move < 0 else "SHORT"
+        if side is None:
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": direction,
+                             "action": "OPEN", "quantity": quantity, "order_type": "LIMIT",
+                             "limit_price": str(bar.close),
+                             "reason_tags": ["grid", "grid_entry"]})
+            ctx.state["position_side"] = direction
+        elif side != direction:
+            ctx.emit_intent({"instrument_id": bar.instrument_id, "direction": side,
+                             "action": "CLOSE", "quantity": quantity, "order_type": "MARKET",
+                             "reason_tags": ["grid", "grid_rebalance"]})
+            ctx.state["position_side"] = None
+        ctx.state["grid_reference"] = str(bar.close)
 ''',
     },
 }
@@ -250,7 +336,14 @@ class StrategyScaffold:
         (strategy_dir / "strategy.py").write_text(strategy_content, encoding="utf-8")
 
         # 生成 features.py（可选）
-        features_content = '"""策略私有特征函数"""\n\n# TODO: 注册私有特征到 Feature Pipeline\n'
+        features_content = '''"""策略私有特征入口。
+
+私有特征必须先注册为 DRAFT FeatureDefinition，再由正式 Feature Pipeline
+物化；生成器不直接改写 Registry。
+"""
+
+FEATURES: tuple[str, ...] = ()
+'''
         (strategy_dir / "features.py").write_text(features_content, encoding="utf-8")
 
         # 生成测试模板
@@ -353,5 +446,5 @@ def test_on_bar():
 
     bar = make_bar(67000.0)
     strategy.on_bar(ctx, bar)
-    # TODO: 验证意图输出
+    assert hasattr(ctx, "emitted_events")
 '''

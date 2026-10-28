@@ -115,13 +115,13 @@ models/
 
 **OrderBookSnapshot**：`instrument_id + ts`；字段 `bids[{price, qty}], asks[{price, qty}], exchange_ts`（低频采样，如每 1m/5m）
 
-**FundingRate**：`instrument_id + funding_ts`；字段 `rate, predicted_rate?, settlement_ts, interval, data_version`（M1.4 新增 data_version）
+**FundingRate**：`instrument_id + funding_ts`；字段 `rate, predicted_rate?, settlement_ts, interval, data_version, available_at?, ingested_at?`。正式 PIT 分区必须提供 `available_at/ingested_at`；`settlement_ts` 存在时还必须不晚于 `decision_time` 才可用于结算。
 
-**OpenInterest**：`instrument_id + ts`；字段 `oi_value, oi_contracts, exchange_ts, data_version`（M1.4 新增 data_version）
+**OpenInterest**：`instrument_id + ts`；字段 `oi_value, oi_contracts, exchange_ts, data_version, available_at?, ingested_at?`。`available_at` 是该快照可被研究读取的 UTC 时间，不得用查询当前时间回填。
 
-**MarkPrice**：`instrument_id + ts`；字段 `mark_price, index_price, exchange_ts`
+**MarkPrice**：`instrument_id + ts`；字段 `mark_price, index_price?, exchange_ts?, available_at?, ingested_at?`。正式回测只能使用 manifest 指定且 `available_at <= decision_time` 的记录。
 
-**FeatureSet**：`instrument_id + ts + feature_name`；字段 `value, feature_version, data_version`
+**FeatureSet**：`instrument_id + ts + feature_name`；字段 `value, feature_version, data_version, available_at?, source_manifest_id?, decision_time?`。正式 Feature 分区中 `available_at`、`source_manifest_id` 和行级 `decision_time` 均为必填 UTC 字段；`decision_time >= ts` 且 `decision_time >= available_at`，查询只可返回同时满足 `available_at <= 请求 decision_time` 与 `行 decision_time <= 请求 decision_time` 的记录。返回对象保留行级 `decision_time`，不得以请求时间覆盖。旧特征目录没有来源 manifest 或 decision-time 时不得进入正式研究路径。
 
 **AdapterStatus**：适配器连接状态快照
 
@@ -638,3 +638,63 @@ Feature 层（`data/features/<feature_version>/<interval>/`）：同 Normalized 
 ---
 
 *本文件为 Schema 基线；DDL 为参考实现，字段与约束以表为准。*
+
+## 7. v0.5 M0 契约增补
+
+本节是 v0.5 M0 的实现契约，优先于同名 v0.4 摘要字段；既有 v0.4 表和模型保留用于兼容读取。
+
+### 7.1 时间与 PIT
+
+所有新增核心记录的时间均为 UTC aware `datetime`。`PointInTimeRecord` 固定表达 `event_time`、`available_at`、`ingested_at`，并拒绝 `available_at < event_time` 或 `ingested_at < available_at`。`BarTiming` 表达 `open_time`、`close_time`、`is_closed` 和 `decision_time`；决策查询必须携带 `decision_time`，只可读取 `available_at <= decision_time` 的记录。
+
+`DatasetManifest` 固定 `manifest_id/dataset_type/schema_version/partition_refs/content_hash/source_refs/created_at`；partition 必须是 data root 内的显式相对路径，内容 hash 覆盖路径和文件字节，MetaDB 中的 manifest 只增不改。`InstrumentRuleVersion` 固定规则 hash、`valid_from/valid_to` 和 `available_at`。两类记录均只增不改。实现位于 `src/qps/core/models/foundation.py`，PIT 查询端口位于 `src/qps/core/ports/v05.py`。
+
+Bars、funding、OI、mark 和 feature output 的正式查询都必须先验证 manifest，再按 `available_at <= decision_time` 过滤；Bars 还必须满足 `is_closed=true` 和 `close_time <= decision_time`。旧格式缺少 PIT 字段时抛出类型化 `DataError`，不按目录扫描或当前接收时间回退。
+
+正式 PIT 分区的每条记录都必须带 `instrument_id`，查询按请求标的精确隔离；缺失或跨标的记录不得通过请求参数回填。Binance REST/WS K 线只提供交易所事件/收盘时间，不提供可审计的源端可见时间，因此适配器输出的 `available_at`/PIT timing 保持未知，未经采集策略补齐不得进入正式 manifest。
+
+Manifest 的内容 hash 校验与 PIT 语义校验是两个独立层次。`ManifestStore.build()` 和默认 `qps data manifest build` 产生的是 candidate/hash-only 记录，可用于诊断或准备质量报告，但不是正式研究证据；`manifest status` 只报告其 `hash_verified`，且始终为 `verified=false`。`build_formal_pit()` 或 `qps data manifest build --formal-pit --instrument-id ... --quality-report ...` 必须先完成 schema、时序、质量报告、标的/周期和 lineage 语义验证才可持久化为正式 PIT manifest。正式研究入口仍必须再次执行 `verify_pit_manifest(require_formal=true)`；质量报告必须是 data root 内可读取且与 manifest ID/content hash/dataset type 绑定的 JSON，查询上下文还必须匹配 instrument、interval 和时间覆盖，FeatureSet 必须验证 source manifest lineage。
+
+### 7.2 Feature Registry 与研究治理
+
+Feature Registry 分为三个不可混淆的不可变实体：
+
+| 实体 | 必要字段 |
+|---|---|
+| `FeatureDefinition` | `feature_id/version/semantic_name/formula_or_code_hash/input_schema/source_types/window/warmup/frequency/available_at_rule/status` |
+| `FeatureMaterialization` | `materialization_id/feature_id/feature_version/input_manifest_ids/output_manifest_id/coverage/content_hash` |
+| `FeatureEvaluation` | `evaluation_id/feature_id/feature_version/strategy_family_id/experiment_id/dataset_split/evidence_metrics` |
+
+`TrialRegistration` 在实验前登记假设、数据、参数空间、主指标、拒绝条件和 seed。M3 的正式研究入口只能把预注册记录连同不可变 candidate descriptor（代码/参数/特征/信号/暴露 fingerprint）提交给预算服务；调用方不得自行挑选或跳过预算。预算服务须在一个事务内解析并预留所有生效的 `GLOBAL/STRATEGY_FAMILY/FEATURE_FAMILY/ACTOR` 额度，追加每个 `(budget_id, trial_id)` 唯一的 `BudgetConsumption`。预留后无论成功、失败、取消、超时或崩溃恢复，trial 均追加终态及原因，且仍计入试验和预留计算额度；重试只能复用同一预留，不得重复消耗或删除记录。
+
+`EvidenceReport` 将 `EvidenceQuality`、`ExpectedEdge`、`RiskEstimate` 分开保存。历史 `AlphaScore` 仅兼容展示，不是资本权重或自动审批契约。只有 append-only 的正式事件驱动 ResearchRun（固定 Release、PIT manifest/materialization、历史规则/成本、环境、seed 与 clock）可被引用为 EvidenceReport；向量化/探索性路径只能诊断，不能产出晋升证据。`BlindChallengeResult` 只保存受限 runner 产生的结果 hash 和独立预算引用；盲测原始范围、数据和答案不写入普通实验、CLI 或 Feature Registry 域，任何揭示先消耗额度，并将区间永久标记为已揭示。
+
+M1 的 Definition/Materialization 由 MetaDB 持久化，重复写入只接受内容相同的幂等重试；Materialization 必须引用已验证的输入和输出 manifest。退役通过新增状态版本表达，旧 Definition、Materialization 和 Manifest 仍可读取。
+
+### 7.3 Release、健康与组合控制面
+
+M2 实现还要求 `StrategyVersion` 保存可重启恢复的 `code_content` artifact。`ReleaseBuilder` 将该 artifact 与参数快照、Feature/PIT manifest IDs、成本、环境和能力清单写入独立只读 archive；archive 内容和 canonical manifest hash 不匹配时，`ReleaseStore` 必须拒绝读取。工作目录、git checkout 和 candidate manifest 不是正式 Runtime 输入。
+
+`StrategyRelease` 必须固定代码/参数/特征/数据/成本/环境 hash、manifest hash、证据报告、允许标的和周期；审批通过后仍不可更新，修改产生新 `release_id`。`ApprovalRecord` 和 `ReleaseDeployment` 单独记录审批与运行实例。
+
+`StrategyHealthAssessment` 分离健康事实、部署状态和 `ResearchDisposition`；`LifecycleAction` 只允许记录降险、冻结、暂停或重新研究请求。`CapitalAllocationPolicy` 是慢周期、版本化、带有效期和审批引用的不可变 Policy；`PortfolioRiskSnapshot` 保存相关性/因子、VaR/CVaR、流动性和压力损失估计，过期或数据不足时由上层采用 UNKNOWN/保守路径。
+
+### 7.4 持久化订单、账本与 Chaos
+
+v0.5 状态机为：
+
+```text
+CREATED -> RISK_RESERVED -> SUBMITTING -> PENDING_ACK -> WORKING
+WORKING/PARTIALLY_FILLED -> CANCEL_PENDING -> CANCELED
+SUBMITTING/PENDING_ACK -> UNKNOWN -> RECONCILING -> WORKING/PARTIALLY_FILLED/FILLED/REJECTED/CANCELED
+```
+
+`OrderCommand` 带稳定 `client_order_id`、`reservation_id`、`allocation_plan_id` 和 `state_version`。状态更新是 compare-and-set；终态后的 Fill 不能被丢弃，必须作为迟到成交追加记录并告警。`RiskReservation` 的释放遵循成交、拒单、撤单确认或过期语义；UNKNOWN 未经对账不得释放。
+
+`AccountLedgerEntry` 与 `StrategyLedgerEntry` 分离，使用 `source_type/source_id/entry_type` 幂等键；`ReconciliationRun` 保存本地版本、交易所快照引用、差异和 residual 原因码。`MarketChaosScenario` 和 `ChaosRun` 保存版本、seed、异常路径、预期不变量和结果，不在 M0 实现场景执行器。
+
+核心记录的 `StringMap` 是递归只读的字符串键值结构；实例读取时保持 map 语义，`model_dump()`、`model_dump_json()` 和 `model_validate_json()` 仍输出/读取 JSON object，键按确定性顺序序列化。它不能通过嵌套对象或数组修改已创建记录。`ExecutionReport.raw_payload` 使用独立的递归只读 `RawJson`，允许 object/array/string/number/boolean/null，保留原始 Broker 回报结构；`StringMap` 不承担原始 JSON 回报语义。金额和数量仍使用 `Decimal`，所有时间必须是 UTC aware。
+
+元数据库新增上述研究/Release/控制面表；订单、outbox/inbox、预留、回报、Fill、双账本和对账表位于独立 `JournalDB`，启用 WAL 与 `synchronous=FULL`。JournalDB 以 `journal_accounts` 和 `allocation_plans` 为父表，订单、预留、回报、Fill、账本和对账通过 `ON DELETE RESTRICT` 外键连接；不可变事实不允许级联删除。`inbox`、`order_state_events`、回报、Fill、账本和对账只增不改，预留只允许状态投影更新，outbox 只允许更新 `published_at`。
+
+`order_commands` 的 durable status 使用 v0.5 状态 CHECK；状态变更必须同时满足完整合法迁移集合、`state_version = OLD + 1`、`updated_at` 单调不倒退、所有命令内容列不可变和 CAS 条件。迁移标识分别为 `m0-v05-contracts` 与 `m0-v05-journal`，schema version 显式记录；migration contract 逐表核验列、主键、唯一键、CHECK、外键目标/删除语义、索引，以及受控 trigger 的 canonical SQL：先按 SQL 词法规则剥离 `--`/`/* */` 注释，再规范化空白、大小写和 SQLite 默认逐行语义，最后与仓库生成的完整 `CREATE TRIGGER` 定义精确比较。比较保留字符串字面量、WHEN 布尔结构、运算符、全部不可变字段、完整状态分支、`RAISE(ABORT, ...)` 和唯一允许的投影字段，因此注释、RAISE 文本或不可达分支不能伪造缺失条件。安全语义变更必须提升 schema version 并经 ADR/迁移引入。fresh/完整 legacy upgrade/re-run 均必须成功，既有表缺少必要列或约束、部分迁移或版本与结构不一致时必须失败即停而不是静默接受漂移。初始化在 legacy rename、DDL、复制、触发器安装、contract 验证和 marker 写入前保存 SQLite 快照；任一步失败即恢复开始前 schema 与数据，不写成功版本，因此可从原始 fixture 安全重试。部署文件备份仍作为额外运维保护。

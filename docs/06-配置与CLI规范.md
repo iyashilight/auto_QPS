@@ -225,9 +225,21 @@ qps
 # 采集 BTC 永续 5m 历史数据
 qps data collect BTC-USDT-PERP --interval 5m --start 2026-01-01 --end 2026-07-01
 
-# 事件驱动回测
+M1 数据与特征命令：
+
+`qps data manifest build <dataset_type> --partitions <path[,path...]>` 默认生成 candidate/hash-only manifest；`manifest status` 会显示 `manifest_kind=candidate`、`hash_verified` 与 `verified=false`。只有带 `--formal-pit --instrument-id <id> --quality-report <ref>` 的命令会在持久化前执行 PIT schema、时间、质量报告和 lineage 验证，并以 `manifest_kind=formal_pit` 报告可用性。`qps data manifest show <manifest_id>`、`qps data manifest verify <manifest_id>`；`qps data feature register/list/show/deprecate/materialize`。命令只能通过 Manifest/Feature Registry 端口操作，输出 manifest ID、内容 hash、版本和 lineage，不以“最新文件”或文件名替代版本选择。
+
+`qps data compute` 的 `--decision-time`，以及 `qps data feature materialize` 的 `--start`、`--end`、`--decision-time` 必须使用带 `Z` 或 `+00:00` 的 UTC ISO 8601；naive、非 UTC offset 和 `start >= end` 均以非零退出，且不得写入 manifest、registry 或 materialization。
+
+# 事件驱动回测（PIT 参数必填）
 qps research backtest trend_breakout --version 3 --mode event_driven \
-  --interval 5m --range 2026-01-01:2026-07-01 --json
+  --manifest-id m_20260805_bars --decision-time 2026-08-05T12:00:00Z \
+  --interval 5m --range 2026-01-01T00:00:00Z:2026-07-01T00:00:00Z --json
+
+# 正式质量验证必须引用 manifest；省略 --manifest-id 会以非零退出
+qps data verify BTC-USDT-PERP --manifest-id m_20260805_bars --json
+
+# verify 同时校验 manifest 的 PIT schema、标的/周期覆盖和质量报告；只验证 hash 不构成研究证据
 
 # 输出（示意）
 # {"run_id":"bt_20260802_1a2b","status":"SUCCEEDED",
@@ -251,3 +263,9 @@ qps risk status --json
 ---
 
 *本文件为配置与 CLI 基线；新增命令必须同步更新本文档。*
+### M2 策略发布 CLI
+
+`strategy check` 读取已登记 durable artifact；`strategy package` 和 `strategy release` 为修改类命令，必须 `--confirm`。Release 必须显式提供参数、环境锁、evidence、formal dataset manifest 和 feature materialization ID，依赖验证失败返回非零且不得写成功 archive。`strategy approve` 只追加审批与 AuditLog，不自动修改 Release status；`strategy show` 在输出前重新校验 archive/hash。
+# M2 v0.5 Release/CLI Boundary
+
+Release archive 必须包含逐文件 hash/size/mode 的 `release-manifest.json`。`ReleaseStore.get_release()` 每次读取重新验证代码、参数、环境、文件集合、manifest 字段和依赖 lineage；任何篡改均失败。生产 ReleaseBuilder 不提供依赖资格绕过开关；CLI e2e 必须验证成功/失败退出码、审批审计和失败无副作用。

@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+case "${1:-}" in
+  m3v2-*) exec "$(dirname "$0")/../.venv/bin/python" "$(dirname "$0")/m3v2_external_fixture_runner.py" "$@" ;;
+  m3-*) exec "$(dirname "$0")/../.venv/bin/python" "$(dirname "$0")/m3_external_fixture_runner.py" "$@" ;;
+  m4-*|m5-*|m6-*|m7-*) exec "$(dirname "$0")/../.venv/bin/python" "$(dirname "$0")/m4_m7_external_fixture_runner.py" "$@" ;;
+  *) exec "$(dirname "$0")/../.venv/bin/python" "$(dirname "$0")/m2_external_fixture_runner.py" "$@" ;;
+esac

@@ -1,4 +1,4 @@
-"""AI Agent 工件模型（M6 占位，见 docs/02 第 3.7 节）"""
+"""AI Agent 工件模型（M7 离线研究增强，见 docs/02 第 3.7 节）"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from qps.core.models.validators import validate_utc_datetime
 
 
 class Artifact(BaseModel):
-    """AI Agent 工件（artifact_id 唯一，不可变，M6 实现）"""
+    """AI Agent 工件（artifact_id 唯一、不可变，用于 M7 离线研究）"""
 
     artifact_id: str = Field(description="工件唯一 ID")
     artifact_type: str = Field(description="工件类型")

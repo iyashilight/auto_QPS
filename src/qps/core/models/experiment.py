@@ -41,6 +41,12 @@ class CostConfig(BaseModel):
     use_depth_snapshots: bool = Field(
         default=False, description="是否使用订单簿深度快照（DEPTH 滑点模型需要）"
     )
+    borrowing_rate: Decimal = Field(default=Decimal("0"), ge=0, description="借贷成本率")
+    liquidation_fee_rate: Decimal = Field(default=Decimal("0"), ge=0, description="强平费用率")
+    capacity_participation_rate: Decimal = Field(default=Decimal("1"), gt=0, le=1, description="容量参与率")
+    min_quantity: Decimal = Field(default=Decimal("0"), ge=0)
+    tick_size: Decimal = Field(default=Decimal("0"), ge=0)
+    lot_size: Decimal = Field(default=Decimal("0"), ge=0)
 
     model_config = {"frozen": True}
 
@@ -67,13 +73,16 @@ class BacktestRequest(BaseModel):
     leverage: Decimal = Field(default=Decimal("3"), description="杠杆")
     margin_mode: MarginMode = Field(default=MarginMode.ISOLATED, description="保证金模式")
     random_seed: int = Field(default=42, description="随机种子")
+    manifest_id: str | None = Field(default=None, description="正式回测使用的已验证数据 manifest")
+    release_id: str | None = Field(default=None, description="正式回测使用的不可变 StrategyRelease")
+    decision_time: datetime | None = Field(default=None, description="正式回测的 PIT 决策时点")
 
     model_config = {"frozen": True}
 
-    @field_validator("start", "end")
+    @field_validator("start", "end", "decision_time")
     @classmethod
-    def _validate_datetime_timezone(cls, v: datetime) -> datetime:
-        return validate_utc_datetime(v)
+    def _validate_datetime_timezone(cls, v: datetime | None) -> datetime | None:
+        return validate_utc_datetime(v) if v is not None else None
 
 
 # ── 优化请求 ──────────────────────────────────────────────

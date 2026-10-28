@@ -36,6 +36,8 @@ class TradeRecord:
     fee: Decimal = Decimal("0")
     slippage: Decimal = Decimal("0")
     funding: Decimal = Decimal("0")
+    borrowing: Decimal = Decimal("0")
+    liquidation_cost: Decimal = Decimal("0")
     pnl: Decimal = Decimal("0")  # 平仓盈亏
     is_liquidation: bool = False
 
@@ -113,6 +115,8 @@ def compute_metrics(
         "fees": str(sum(t.fee for t in trades)),
         "slippage": str(sum(t.slippage for t in trades)),
         "funding": str(sum(t.funding for t in trades)),
+        "borrowing": str(sum(t.borrowing for t in trades)),
+        "liquidation": str(sum(t.liquidation_cost for t in trades)),
     }
 
     oos_metrics: dict[str, Any] = {}

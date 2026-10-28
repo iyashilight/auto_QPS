@@ -62,15 +62,22 @@ class OrderSide(StrEnum):
 class OrderStatus(StrEnum):
     """订单状态（状态机见 _ORDER_TRANSITIONS）"""
 
+    # v0.4 compatibility values. New durable commands use the v0.5 values below.
     NEW = "NEW"
     PENDING_SUBMIT = "PENDING_SUBMIT"
+    CREATED = "CREATED"
+    RISK_RESERVED = "RISK_RESERVED"
+    SUBMITTING = "SUBMITTING"
     PENDING_ACK = "PENDING_ACK"
     WORKING = "WORKING"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    CANCEL_PENDING = "CANCEL_PENDING"
     FILLED = "FILLED"
     CANCELED = "CANCELED"
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
+    UNKNOWN = "UNKNOWN"
+    RECONCILING = "RECONCILING"
 
 
 class OrderType(StrEnum):
@@ -335,25 +342,147 @@ class AdapterConnectionStatus(StrEnum):
     RECONNECTING = "RECONNECTING"
 
 
+class ResearchScope(StrEnum):
+    """Research budget scope."""
+
+    GLOBAL = "GLOBAL"
+    STRATEGY_FAMILY = "STRATEGY_FAMILY"
+    FEATURE_FAMILY = "FEATURE_FAMILY"
+    ACTOR = "ACTOR"
+
+
+class ResearchActorType(StrEnum):
+    HUMAN = "HUMAN"
+    SCRIPT = "SCRIPT"
+    OPTIMIZER = "OPTIMIZER"
+    AI = "AI"
+
+
+class TrialStatus(StrEnum):
+    """不可变研究 trial 生命周期；终态只能追加，不能回写。"""
+
+    REGISTERED = "REGISTERED"
+    RESERVED = "RESERVED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    TIMED_OUT = "TIMED_OUT"
+
+
+class ReleaseStatus(StrEnum):
+    DRAFT = "DRAFT"
+    RESEARCH_VALIDATED = "RESEARCH_VALIDATED"
+    PAPER_APPROVED = "PAPER_APPROVED"
+    PAPER_RUNNING = "PAPER_RUNNING"
+    LIVE_CANDIDATE = "LIVE_CANDIDATE"
+    LIVE_APPROVED = "LIVE_APPROVED"
+    LIVE_RUNNING = "LIVE_RUNNING"
+    FROZEN = "FROZEN"
+    RETIRED = "RETIRED"
+
+
+class ApprovalStatus(StrEnum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+
+class HealthAssessmentStatus(StrEnum):
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    UNKNOWN = "UNKNOWN"
+    CRITICAL = "CRITICAL"
+
+
+class DeploymentHealthStatus(StrEnum):
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    FROZEN = "FROZEN"
+    STOPPED = "STOPPED"
+
+
+class ResearchDisposition(StrEnum):
+    NONE = "NONE"
+    MONITOR = "MONITOR"
+    RESEARCH_REQUIRED = "RESEARCH_REQUIRED"
+
+
+class LifecycleActionType(StrEnum):
+    REDUCE_RISK = "REDUCE_RISK"
+    FREEZE = "FREEZE"
+    PAUSE = "PAUSE"
+    RESEARCH_REQUIRED = "RESEARCH_REQUIRED"
+
+
+class ReservationStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    PARTIALLY_CONSUMED = "PARTIALLY_CONSUMED"
+    CONSUMED = "CONSUMED"
+    RELEASED = "RELEASED"
+    EXPIRED = "EXPIRED"
+
+
+class LedgerType(StrEnum):
+    ACCOUNT = "ACCOUNT"
+    STRATEGY = "STRATEGY"
+
+
+class ReconciliationStatus(StrEnum):
+    STARTED = "STARTED"
+    MATCHED = "MATCHED"
+    DIFF = "DIFF"
+    FAILED = "FAILED"
+
+
+class FeatureStatus(StrEnum):
+    DRAFT = "DRAFT"
+    ACTIVE = "ACTIVE"
+    DEPRECATED = "DEPRECATED"
+    RETIRED = "RETIRED"
+
+
+class DatasetSplit(StrEnum):
+    DEVELOPMENT = "DEVELOPMENT"
+    VALIDATION = "VALIDATION"
+    BLIND_CHALLENGE = "BLIND_CHALLENGE"
+    FORWARD_PAPER = "FORWARD_PAPER"
+
+
 # ── 订单状态机 ─────────────────────────────────────────────
 
 # 合法迁移表：key = 当前状态，value = 允许迁移到的状态集合
 _ORDER_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
     OrderStatus.NEW: frozenset({OrderStatus.PENDING_SUBMIT}),
     OrderStatus.PENDING_SUBMIT: frozenset({OrderStatus.PENDING_ACK, OrderStatus.CANCELED, OrderStatus.REJECTED}),
+    OrderStatus.CREATED: frozenset({OrderStatus.RISK_RESERVED, OrderStatus.REJECTED, OrderStatus.EXPIRED}),
+    OrderStatus.RISK_RESERVED: frozenset({OrderStatus.SUBMITTING, OrderStatus.REJECTED, OrderStatus.EXPIRED}),
+    OrderStatus.SUBMITTING: frozenset({OrderStatus.PENDING_ACK, OrderStatus.UNKNOWN, OrderStatus.REJECTED}),
     OrderStatus.PENDING_ACK: frozenset({OrderStatus.WORKING, OrderStatus.REJECTED, OrderStatus.CANCELED}),
     OrderStatus.WORKING: frozenset({
         OrderStatus.PARTIALLY_FILLED,
         OrderStatus.FILLED,
-        OrderStatus.CANCELED,
+        OrderStatus.CANCEL_PENDING,
+        OrderStatus.CANCELED,  # v0.4 direct-cancel compatibility
         OrderStatus.EXPIRED,
     }),
     OrderStatus.PARTIALLY_FILLED: frozenset({
         OrderStatus.WORKING,
         OrderStatus.PARTIALLY_FILLED,
         OrderStatus.FILLED,
-        OrderStatus.CANCELED,
+        OrderStatus.CANCEL_PENDING,
+        OrderStatus.CANCELED,  # v0.4 direct-cancel compatibility
         OrderStatus.EXPIRED,
+    }),
+    OrderStatus.CANCEL_PENDING: frozenset({OrderStatus.CANCELED, OrderStatus.UNKNOWN}),
+    OrderStatus.UNKNOWN: frozenset({OrderStatus.RECONCILING}),
+    OrderStatus.RECONCILING: frozenset({
+        OrderStatus.WORKING,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELED,
     }),
     # 终态：不允许再迁移
     OrderStatus.FILLED: frozenset(),

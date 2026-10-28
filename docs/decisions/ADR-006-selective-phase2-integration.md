@@ -37,4 +37,4 @@ docs/05 事件目录新增（schema/语义入契约，未实现前禁止广播�
 
 ## 状态
 
-已接受（2026-08-04，Codex 架构审查）。
+部分已替代（2026-08-05）。历史选择性并入记录保留；Alpha Score 动态权重、M4 Regime、M5 Event/Sentiment 与 M4 后 PostgreSQL 双写窗口已由 `ADR-010-v05-architecture-rebaseline.md` 修订。

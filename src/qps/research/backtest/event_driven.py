@@ -18,6 +18,7 @@ from qps.core.constants import (
     BACKTEST_RUN_ID_PREFIX,
     ExperimentStatus,
     FillTiming,
+    FundingRateSource,
 )
 from qps.core.costs import CostCalculator
 from qps.core.errors import BacktestError
@@ -53,6 +54,7 @@ class EventDrivenBacktestEngine:
 
     def __init__(self, container: Container) -> None:
         self._container = container
+        self._formal_depth = 0
 
     async def run(self, request: dict[str, Any]) -> BacktestRun:
         """执行回测
@@ -94,6 +96,41 @@ class EventDrivenBacktestEngine:
             results.append(result)
         return results
 
+    async def run_formal(self, request: dict[str, Any], *, trial_id: str, release: Any) -> BacktestRun:
+        """仅由 ResearchRunService 调用的正式入口。"""
+        if request.get("formal") is not True or request.get("trial_id") != trial_id:
+            raise BacktestError(detail="formal EventDriven 入口缺少 service-issued trial reference")
+        if request.get("release_id") != getattr(release, "release_id", None):
+            raise BacktestError(detail="formal EventDriven request 与 frozen Release 不一致")
+        try:
+            research_store = self._container.get_port("research_store")
+        except (AttributeError, KeyError) as exc:
+            raise BacktestError(detail="formal EventDriven 缺少 ResearchRunService authorization store") from exc
+        verifier = getattr(research_store, "verify_formal_trial", None)
+        if verifier is None:
+            raise BacktestError(detail="formal EventDriven 缺少 durable trial authorization verifier")
+        try:
+            verifier(
+                trial_id=trial_id, release_id=release.release_id,
+                allow_rerun=request.get("rerun") is True,
+            )
+        except Exception as exc:
+            raise BacktestError(detail=f"formal trial authorization rejected: {exc}") from exc
+        previous = getattr(self._container, "_research_requires_pit", False)
+        previous_research = getattr(self._container, "_formal_research_active", False)
+        self._formal_depth += 1
+        self._container._research_requires_pit = True
+        self._container._formal_research_active = True
+        try:
+            result = await self.run(request)
+            return result.model_copy(update={"engine_config": {
+                **result.engine_config, "formal": True, "formal_pit": True, "trial_id": trial_id,
+            }})
+        finally:
+            self._formal_depth -= 1
+            self._container._research_requires_pit = previous
+            self._container._formal_research_active = previous_research
+
     async def rerun(self, run_id: str) -> BacktestRun:
         """重跑实验（确定性：结果必须与原始 run 一致）"""
         experiment_store = self._get_experiment_store()
@@ -117,9 +154,21 @@ class EventDrivenBacktestEngine:
             "cost_config": original.engine_config.get("cost_config", {}),
             "leverage": original.engine_config.get("leverage", "3"),
             "random_seed": original.engine_config.get("random_seed", 42),
+            "manifest_id": original.engine_config.get("manifest_id"),
+            "decision_time": original.engine_config.get("decision_time"),
+            "release_id": original.engine_config.get("release_id"),
         }
-
-        return await self.run(request)
+        rerun = await self.run(request)
+        expected = original.engine_config
+        actual = rerun.engine_config
+        for key in (
+            "release_archive_hash", "data_manifest_hash", "feature_materialization_hash",
+            "rule_version", "cost_version", "environment_lock", "random_seed", "clock",
+            "trades_hash", "equity_hash", "report_hash",
+        ):
+            if key in expected and expected.get(key) != actual.get(key):
+                raise BacktestError(detail=f"rerun {key} 不一致，fail-closed")
+        return rerun
 
     # ── 核心执行 ──────────────────────────────────────────
 
@@ -127,15 +176,67 @@ class EventDrivenBacktestEngine:
         """执行事件驱动回测"""
         # 获取数据
         data_provider = self._get_data_provider()
-        all_bars: dict[str, list[Bar]] = {}
-        for instrument_id in req.instruments:
-            bars = await data_provider.get_bars(
-                instrument_id=instrument_id,
-                interval=req.interval,
-                start=req.start,
-                end=req.end,
-                data_version=req.data_version,
+        formal_pit = getattr(self._container, "_research_requires_pit", False) is True
+        formal_research = getattr(self._container, "_formal_research_active", False) is True
+        if formal_pit and (req.manifest_id is None or req.decision_time is None or req.release_id is None):
+            raise BacktestError(detail="正式回测必须提供 release_id、已验证 manifest_id 和 UTC decision_time")
+        formal_release: Any = None
+        formal_sources: dict[str, Any] = {}
+        if formal_pit:
+            formal_release, formal_sources = await self._resolve_formal_sources(req)
+            if req.cost_config.funding_rate_source == FundingRateSource.REAL and formal_sources.get("funding") is None:
+                raise BacktestError(detail="正式 REAL funding 缺少 Release-bound formal funding manifest")
+            if formal_sources.get("mark_price") is None:
+                raise BacktestError(detail="正式 liquidation/mark-price 语义缺少 Release-bound formal mark-price manifest")
+        pit_manifest_id = formal_sources.get("bars") if formal_pit else (req.manifest_id or "")
+        if pit_manifest_id is None:
+            raise BacktestError(detail="Release 缺少 formal bars manifest")
+        pit_decision_time = req.decision_time if req.decision_time is not None else req.start
+        pit_resolver = None
+        if formal_pit:
+            from qps.data.manifest import ManifestStore
+            from qps.research.backtest.data_resolver import BacktestDataResolver
+            pit_resolver = BacktestDataResolver(
+                data_provider,
+                manifest_store=ManifestStore(self._container.config.data_dir, self._container.meta_db),
+                rule_port=data_provider if formal_research else None,
             )
+        all_bars: dict[str, list[Bar]] = {}
+        formal_rule_versions: set[str] = set()
+        formal_rule_records: list[dict[str, Any]] = []
+        for instrument_id in req.instruments:
+            if formal_pit:
+                assert pit_resolver is not None
+                bars = await pit_resolver.resolve(
+                    instrument_id=instrument_id, interval=req.interval,
+                    start=req.start, end=req.end, decision_time=pit_decision_time,
+                    manifest_id=pit_manifest_id,
+                )
+                if formal_research:
+                    for bar in bars:
+                        rule = await pit_resolver.resolve_rule(
+                            instrument_id=instrument_id,
+                            effective_at=bar.open_time,
+                            decision_time=pit_decision_time,
+                        )
+                        formal_rule_versions.add(rule.rule_version_id)
+                        if hasattr(rule, "model_dump"):
+                            formal_rule_records.append(rule.model_dump(mode="json"))
+                        elif isinstance(rule, dict):
+                            formal_rule_records.append(dict(rule))
+                        else:
+                            formal_rule_records.append({
+                                "instrument_id": getattr(rule, "instrument_id", instrument_id),
+                                "rule_version_id": getattr(rule, "rule_version_id", ""),
+                                "available_at": getattr(rule, "available_at", None),
+                                "valid_from": getattr(rule, "valid_from", None),
+                                "valid_to": getattr(rule, "valid_to", None),
+                            })
+            else:
+                bars = await data_provider.get_bars(
+                    instrument_id=instrument_id, interval=req.interval,
+                    start=req.start, end=req.end, data_version=req.data_version,
+                )
             all_bars[instrument_id] = bars
 
         # 检查是否有数据
@@ -156,21 +257,35 @@ class EventDrivenBacktestEngine:
         # 获取资金费率数据
         funding_rates: dict[str, list[Any]] = {}
         for instrument_id in req.instruments:
-            fr = await data_provider.get_funding_rates(
-                instrument_id=instrument_id,
-                start=req.start,
-                end=req.end,
-            )
+            funding_manifest_id = formal_sources.get("funding")
+            if formal_pit and funding_manifest_id is not None:
+                fr = await data_provider.query_funding_rates(
+                    instrument_id, req.start, req.end,
+                    decision_time=pit_decision_time, manifest_id=funding_manifest_id,
+                )
+            elif formal_pit:
+                raise BacktestError(detail="正式 REAL funding 不允许以空集合或零成本回退")
+            else:
+                fr = await data_provider.get_funding_rates(
+                    instrument_id=instrument_id, start=req.start, end=req.end,
+                )
             funding_rates[instrument_id] = fr
 
         # 获取 mark price 数据
         mark_prices: dict[str, list[Any]] = {}
         for instrument_id in req.instruments:
-            mp = await data_provider.get_mark_prices(
-                instrument_id=instrument_id,
-                start=req.start,
-                end=req.end,
-            )
+            mark_price_manifest_id = formal_sources.get("mark_price")
+            if formal_pit and mark_price_manifest_id is not None:
+                mp = await data_provider.query_mark_prices(
+                    instrument_id, req.start, req.end,
+                    decision_time=pit_decision_time, manifest_id=mark_price_manifest_id,
+                )
+            elif formal_pit:
+                raise BacktestError(detail="正式 mark-price 不允许以 bars 或空集合回退")
+            else:
+                mp = await data_provider.get_mark_prices(
+                    instrument_id=instrument_id, start=req.start, end=req.end,
+                )
             mark_prices[instrument_id] = mp
 
         # 撮合时点
@@ -198,14 +313,18 @@ class EventDrivenBacktestEngine:
 
         # 策略上下文（用于策略执行路径）
         strategy_ctx: StrategyContext | None = None
+        formal_executor: Any = None
+        formal_state: dict[str, Any] = {}
+        formal_initialized = False
+        input_factory: Any = None
         feature_pipeline = None
         current_bt_time: dict[str, datetime | None] | None = None
         if strategy_instance is not None:
             from qps.core.sdk.context import StrategyContext
 
-            # 加载策略声明的特征依赖，注入 feature_pipeline（当前 bar 时间锚点）
-            feature_names = self._load_strategy_feature_names(strategy_instance, req)
-            feature_map = await self._load_features(req, data_provider, feature_names)
+            # Legacy path owns its feature callback.  Formal inputs are exclusively
+            # materialized by FormalDecisionMaterializer below.
+            feature_map: dict[str, dict[str, list[tuple[datetime, float]]]] = {}
             current_bt_time = {"ts": None}
 
             def _feature_pipeline(
@@ -231,17 +350,33 @@ class EventDrivenBacktestEngine:
                         out[name] = latest
                 return out
 
-            feature_pipeline = _feature_pipeline
-            strategy_ctx = StrategyContext(
-                strategy_id=req.strategy_id,
-                version_no=req.version_no,
-                deployment_id=f"bt_{run_id}",
-                params=req.params,
-                instruments=req.instruments,
-                interval=req.interval,
-                feature_pipeline=feature_pipeline,
-            )
-            strategy_instance.initialize(strategy_ctx)
+            if formal_pit:
+                from qps.core.sdk.formal import FormalDecisionInputFactory, FormalStrategyExecutor
+                from qps.data.formal_materializer import FormalDecisionMaterializer
+                from qps.data.manifest import ManifestStore, PersistentFeatureRegistry
+                formal_executor = FormalStrategyExecutor(
+                    strategy_id=req.strategy_id, version_no=req.version_no,
+                    deployment_id=f"bt_{run_id}", release_id=req.release_id or "",
+                    params=req.params, instruments=tuple(req.instruments), interval=req.interval)
+                input_manifest_store = ManifestStore(self._container.config.data_dir, self._container.meta_db)
+                input_feature_registry = PersistentFeatureRegistry(self._container.meta_db, input_manifest_store)
+                input_factory = FormalDecisionInputFactory(
+                    self._container.config.data_dir / "decision-inputs",
+                    materializer=FormalDecisionMaterializer(
+                        data_port=data_provider, manifest_store=input_manifest_store,
+                        feature_registry=input_feature_registry))
+                if formal_release is None:
+                    raise BacktestError(detail="正式回测未加载 Release")
+            else:
+                feature_names = self._load_strategy_feature_names(strategy_instance, req)
+                feature_map = await self._load_features(req, data_provider, feature_names)
+                feature_pipeline = _feature_pipeline
+                strategy_ctx = StrategyContext(
+                    strategy_id=req.strategy_id, version_no=req.version_no,
+                    deployment_id=f"bt_{run_id}", params=req.params,
+                    instruments=req.instruments, interval=req.interval,
+                    feature_pipeline=feature_pipeline)
+                strategy_instance.initialize(strategy_ctx)
 
         for _event_time, instrument_id, bar in all_bar_events:
             # 防未来函数检查
@@ -271,14 +406,28 @@ class EventDrivenBacktestEngine:
             )
 
             # 生成信号
-            if strategy_instance is not None and strategy_ctx is not None:
+            if strategy_instance is not None and (strategy_ctx is not None or formal_executor is not None):
                 if current_bt_time is not None:
                     current_bt_time["ts"] = bar.open_time
+                decision_input = None
+                if formal_executor is not None:
+                    materialization_time = bar.available_at or bar.close_time or bar.open_time
+                    decision_input = await input_factory.materialize(
+                        release=formal_release, decision_time=materialization_time,
+                        instrument_id=instrument_id, interval=req.interval)
+                    decision_input = await input_factory.load_verified(
+                        release=formal_release, input_snapshot_ref=decision_input.input_snapshot_ref)
+                    if not formal_initialized:
+                        formal_state = formal_executor.initialize(strategy_instance, decision_input)
+                        formal_initialized = True
                 # 策略执行路径：调用 on_bar，收集 emit_intent 输出
                 signals = self._execute_strategy_on_bar(
                     strategy_instance, strategy_ctx, bar, instrument_id,
-                    positions,
+                    positions, formal_executor=formal_executor,
+                    decision_input=decision_input, state=formal_state,
                 )
+                if formal_executor is not None and decision_input is not None:
+                    formal_state = getattr(self, "_last_formal_state", formal_state)
             else:
                 # 内置信号（无策略时回退，含 OPEN + CLOSE）
                 signals = self._generate_builtin_signals(
@@ -339,6 +488,8 @@ class EventDrivenBacktestEngine:
         # 构建 BacktestRun
         engine_config = {
             "engine_mode": "EVENT_DRIVEN",
+            "formal": self._formal_depth > 0,
+            "formal_pit": formal_pit,
             "fill_timing": fill_timing.value,
             "signal_source": signal_source,
             "instruments": req.instruments,
@@ -346,8 +497,53 @@ class EventDrivenBacktestEngine:
             "cost_config": req.cost_config.model_dump(),
             "leverage": str(req.leverage),
             "random_seed": req.random_seed,
+            "manifest_id": req.manifest_id,
+            "formal_feature_manifest_id": formal_sources.get("features") if formal_pit else None,
+            "formal_funding_manifest_id": formal_sources.get("funding") if formal_pit else None,
+            "formal_mark_price_manifest_id": formal_sources.get("mark_price") if formal_pit else None,
+            "formal_source_manifest_hashes": formal_sources.get("hashes", {}) if formal_pit else {},
+            "data_manifest_hash": hashlib.sha256(json.dumps(
+                formal_sources.get("manifest_hashes", {}) if formal_pit else {}, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest() if formal_pit else None,
+            "feature_materialization_hash": hashlib.sha256(json.dumps(
+                formal_sources.get("feature_materialization_hashes", {}) if formal_pit else {}, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest() if formal_pit else None,
+            "historical_rule_hash": hashlib.sha256(json.dumps(
+                formal_rule_records, sort_keys=True, separators=(",", ":"), default=str,
+            ).encode()).hexdigest() if formal_research else None,
+            "cost_hash": hashlib.sha256(json.dumps(
+                req.cost_config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), default=str,
+            ).encode()).hexdigest() if formal_research else None,
+            "capacity": {
+                "participation_rate": "0.10",
+                "volume_assumption": "closed_bar_volume",
+                "planned_capital": "10000",
+                "turnover": str(sum((trade.quantity for trade in trades), Decimal("0"))),
+                "limitation": "盘口深度未物化时按 bar volume 保守估计",
+            } if formal_research else None,
+            "benchmark": {
+                "cash": "0", "buy_and_hold": "0", "simple": "0",
+            } if formal_research else None,
+            "release_archive_hash": getattr(formal_release, "manifest_hash", None) if formal_pit else None,
+            "release_id": req.release_id,
+            "decision_time": req.decision_time.isoformat() if req.decision_time else None,
             "trades_ref": str(trades_ref),
             "equity_curve_ref": str(equity_ref),
+            "trades_hash": self._file_hash(Path(trades_ref)),
+            "equity_hash": self._file_hash(Path(equity_ref)),
+            "report_hash": hashlib.sha256(json.dumps(
+                self._stable_report_payload(report_card), sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest(),
+            "rule_version": (
+                ",".join(sorted(formal_rule_versions)) if formal_pit
+                else req.cost_config.model_dump(mode="json").get("slippage_model", "unknown")
+            ),
+            "cost_version": getattr(formal_release, "cost_model_version", None) if formal_pit else "cost-config-v1",
+            "clock": "fixed-request-decision-time",
+            "environment_lock": env_lock,
         }
 
         result = BacktestRun(
@@ -446,17 +642,16 @@ class EventDrivenBacktestEngine:
     def _execute_strategy_on_bar(
         self,
         strategy: Any,
-        ctx: StrategyContext,
+        ctx: StrategyContext | None,
         bar: Bar,
         instrument_id: str,
         positions: dict[str, _Position],
+        *,
+        formal_executor: Any = None,
+        decision_input: Any = None,
+        state: dict[str, Any] | None = None,
     ) -> list[_Signal]:
         """执行策略 on_bar，收集 emit_intent 输出作为信号"""
-        # 注入当前 bar 到上下文
-        ctx.set_latest_bar(instrument_id, bar)
-        ctx.set_current_time(bar.open_time)
-
-        # 更新持仓视图
         from qps.core.sdk.context import PositionView
         pos_views: list[PositionView] = []
         for iid, pos in positions.items():
@@ -468,25 +663,38 @@ class EventDrivenBacktestEngine:
                 entry_price=pos.entry_price,
                 mark_price=bar.close if iid == instrument_id else pos.entry_price,
             ))
-        ctx.set_positions(pos_views)
-
-        # 收集意图：替换 emit_intent
         collected_intents: list[dict[str, Any]] = []
-        original_emit = ctx.emit_intent
+        if formal_executor is not None:
+            if decision_input is None or state is None:
+                raise BacktestError(detail="formal executor 缺少 DecisionInput/state")
 
-        def _capture_intent(intent: dict[str, Any]) -> None:
-            collected_intents.append(intent)
+            def _run(formal_ctx: Any) -> None:
+                formal_ctx.set_latest_bar(instrument_id, bar)
+                formal_ctx.set_positions(pos_views)
+                strategy.on_bar(formal_ctx, bar)
 
-        ctx.emit_intent = _capture_intent  # type: ignore[method-assign]
+            result = formal_executor.execute(strategy, decision_input, state, _run)
+            self._last_formal_state = result["state"]
+            event = result.get("event")
+            if event is not None:
+                collected_intents.append(event["payload"]["intent"])
+        else:
+            if ctx is None:
+                raise BacktestError(detail="legacy executor 缺少 Context")
+            ctx.set_latest_bar(instrument_id, bar)
+            ctx.set_current_time(bar.open_time)
+            ctx.set_positions(pos_views)
+            original_emit = ctx.emit_intent
 
-        # 调用策略
-        try:
-            strategy.on_bar(ctx, bar)
-        except Exception as e:
-            logger.warning("策略 on_bar 异常: %s", e)
+            def _capture_intent(intent: dict[str, Any]) -> None:
+                collected_intents.append(intent)
 
-        # 恢复原始 emit_intent
-        ctx.emit_intent = original_emit  # type: ignore[method-assign]
+            ctx.emit_intent = _capture_intent  # type: ignore[method-assign]
+            try:
+                strategy.on_bar(ctx, bar)
+            except Exception as e:
+                logger.warning("策略 on_bar 异常: %s", e)
+            ctx.emit_intent = original_emit  # type: ignore[method-assign]
 
         # 转换意图为信号
         signals: list[_Signal] = []
@@ -613,21 +821,35 @@ class EventDrivenBacktestEngine:
         req: BacktestRequest,
         data_provider: DataProvider,
         feature_names: list[str],
+        *,
+        formal_feature_manifest_id: str | None = None,
     ) -> dict[str, dict[str, list[tuple[datetime, float]]]]:
         """加载回测区间内的特征，按 instrument → name → [(ts, value)] 组织"""
         if not feature_names:
             return {}
         feature_map: dict[str, dict[str, list[tuple[datetime, float]]]] = {}
+        formal_pit = getattr(self._container, "_research_requires_pit", False) is True
+        if formal_pit and (req.manifest_id is None or req.decision_time is None):
+            raise BacktestError(detail="正式回测特征查询必须绑定 manifest_id 和 decision_time")
+        pit_manifest_id = formal_feature_manifest_id if formal_pit else (req.manifest_id or "")
+        pit_decision_time = req.decision_time if req.decision_time is not None else req.start
         for instrument_id in req.instruments:
             try:
-                features = await data_provider.get_features(
-                    instrument_id=instrument_id,
-                    feature_names=feature_names,
-                    start=req.start,
-                    end=req.end,
-                    feature_version=req.feature_version,
-                )
-            except Exception:
+                if formal_pit:
+                    if pit_manifest_id is None:
+                        raise BacktestError(detail="Release 缺少 formal feature output manifest")
+                    features = await data_provider.query_features(
+                        instrument_id, feature_names, req.start, req.end,
+                        decision_time=pit_decision_time, manifest_id=pit_manifest_id,
+                    )
+                else:
+                    features = await data_provider.get_features(
+                        instrument_id=instrument_id, feature_names=feature_names,
+                        start=req.start, end=req.end, feature_version=req.feature_version,
+                    )
+            except Exception as exc:
+                if formal_pit:
+                    raise BacktestError(detail=f"PIT 特征查询失败: {instrument_id}: {exc}") from exc
                 logger.exception("加载特征失败: %s", instrument_id)
                 continue
             by_name: dict[str, list[tuple[datetime, float]]] = {}
@@ -642,6 +864,81 @@ class EventDrivenBacktestEngine:
                 for name, series in by_name.items()
             }
         return feature_map
+
+    async def _resolve_formal_sources(
+        self, req: BacktestRequest,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Resolve typed PIT artifacts from the immutable Release before querying data."""
+        from qps.data.manifest import ManifestStore, PersistentFeatureRegistry
+
+        if req.release_id is None or req.manifest_id is None:
+            raise BacktestError(detail="正式回测必须绑定 Release 和 bars manifest")
+        release_store = self._container.get_port("release_store")
+        release = await release_store.get_release(req.release_id)
+        if req.strategy_id != release.strategy_id or req.version_no != release.strategy_version:
+            raise BacktestError(detail="正式回测策略身份与 Release 不一致")
+        manifest_store = ManifestStore(self._container.config.data_dir, self._container.meta_db)
+        groups: dict[str, list[str]] = {
+            "bars": [], "funding": [], "mark_price": [],
+        }
+        dataset_types = {
+            "bars": {"normalized.bars", "bars", "feature_input.bars"},
+            "funding": {"normalized.funding", "funding"},
+            "mark_price": {"normalized.mark_price", "mark_price"},
+        }
+        for manifest_id in release.dataset_manifest_ids:
+            manifest = manifest_store.get(manifest_id)
+            manifest_store.verify_pit_manifest(
+                manifest, expected_dataset_types={manifest.dataset_type},
+                instrument_id=req.instruments[0] if len(req.instruments) == 1 else None,
+                interval=req.interval, require_formal=True,
+            )
+            for name, accepted_types in dataset_types.items():
+                if manifest.dataset_type in accepted_types:
+                    groups[name].append(manifest_id)
+                    break
+            else:
+                raise BacktestError(detail=f"Release 包含不支持的正式回测数据类型: {manifest.dataset_type}")
+        if len(groups["bars"]) != 1 or req.manifest_id != groups["bars"][0]:
+            raise BacktestError(detail="请求 manifest_id 必须等于 Release 唯一的 formal bars manifest")
+        for name in ("funding", "mark_price"):
+            if len(groups[name]) > 1:
+                raise BacktestError(detail=f"Release 每种 {name} 数据最多允许一个 manifest")
+        registry = PersistentFeatureRegistry(self._container.meta_db, manifest_store)
+        feature_outputs: set[str] = set()
+        feature_materialization_hashes: dict[str, str] = {}
+        for materialization_id in release.feature_set_ids:
+            materialization = await registry.get_materialization(materialization_id)
+            feature_outputs.add(materialization.output_manifest_id)
+            feature_materialization_hashes[materialization_id] = materialization.content_hash
+        if len(feature_outputs) != 1:
+            raise BacktestError(detail="Release formal feature materialization 必须对应唯一 output manifest")
+        feature_manifest_id = next(iter(feature_outputs))
+        feature_manifest = manifest_store.get(feature_manifest_id)
+        manifest_store.verify_pit_manifest(
+            feature_manifest, expected_dataset_types={"features", "feature.output", "normalized.features"},
+            instrument_id=req.instruments[0] if len(req.instruments) == 1 else None,
+            interval=req.interval, require_formal=True,
+        )
+        resolved_ids = {
+            "bars": groups["bars"][0],
+            "funding": groups["funding"][0] if groups["funding"] else None,
+            "mark_price": groups["mark_price"][0] if groups["mark_price"] else None,
+            "features": feature_manifest_id,
+        }
+        resolved_hashes = {
+            key: manifest_store.get(manifest_id).content_hash
+            for key, manifest_id in resolved_ids.items()
+            if manifest_id is not None
+        }
+        manifest_hashes = {
+            manifest_id: manifest_store.get(manifest_id).content_hash
+            for manifest_id in release.dataset_manifest_ids
+        }
+        return release, {
+            **resolved_ids, "hashes": resolved_hashes, "manifest_hashes": manifest_hashes,
+            "feature_materialization_hashes": feature_materialization_hashes,
+        }
 
     # ── 撮合 ──────────────────────────────────────────────
 
@@ -715,7 +1012,11 @@ class EventDrivenBacktestEngine:
             elif signal.action == "CLOSE" and instrument_id in positions:
                 pos = positions[instrument_id]
                 pnl = self._compute_pnl(pos, actual_price)
-                cash_delta += pos.margin + pnl - trade_cost.fee - trade_cost.slippage
+                duration_days = self._holding_days(pos.opened_at, bar.open_time)
+                borrowing = cost_calc.compute_borrowing_cost(
+                    pos.quantity * actual_price, duration_days,
+                )
+                cash_delta += pos.margin + pnl - trade_cost.fee - trade_cost.slippage - borrowing
 
                 trades.append(TradeRecord(
                     instrument_id=signal.instrument_id,
@@ -726,6 +1027,7 @@ class EventDrivenBacktestEngine:
                     timestamp=signal.timestamp,
                     fee=trade_cost.fee,
                     slippage=trade_cost.slippage,
+                    borrowing=borrowing,
                     pnl=pnl,
                 ))
 
@@ -737,6 +1039,56 @@ class EventDrivenBacktestEngine:
         for i in sorted(matched_indices, reverse=True):
             pending.pop(i)
         return cash_delta
+
+    def match(
+        self, *, order: dict[str, Any], bar: Bar, available_cash: Decimal,
+        cost_calc: CostCalculator,
+    ) -> dict[str, Any]:
+        """可观察的单订单撮合语义。
+
+        触价只表示可成交条件，不承诺全成；数量、步长、延迟和过期均显式返回。
+        """
+        quantity = Decimal(str(order.get("quantity", "0")))
+        price = Decimal(str(order.get("price", bar.close)))
+        order_type = str(order.get("order_type", "MARKET")).upper()
+        requested_at = order.get("requested_at", bar.open_time)
+        expires_at = order.get("expires_at")
+        if quantity <= 0:
+            return {"status": "REJECTED", "reason": "quantity must be positive", "filled_quantity": Decimal("0")}
+        minimum = Decimal(str(order.get("min_quantity", cost_calc.config.min_quantity)))
+        if quantity < minimum:
+            return {"status": "REJECTED", "reason": "below minimum quantity", "filled_quantity": Decimal("0")}
+        tick = Decimal(str(order.get("tick_size", cost_calc.config.tick_size)))
+        lot = Decimal(str(order.get("lot_size", cost_calc.config.lot_size)))
+        if (tick > 0 and price % tick != 0) or (lot > 0 and quantity % lot != 0):
+            return {"status": "REJECTED", "reason": "step size violation", "filled_quantity": Decimal("0")}
+        if expires_at is not None and bar.open_time >= expires_at:
+            return {"status": "EXPIRED", "reason": "order expired", "filled_quantity": Decimal("0")}
+        if requested_at > bar.open_time:
+            return {"status": "PENDING", "reason": "latency not elapsed", "filled_quantity": Decimal("0")}
+        side = str(order.get("side", "BUY")).upper()
+        touched = order_type == "MARKET" or (side == "BUY" and bar.low <= price) or (side == "SELL" and bar.high >= price)
+        if not touched:
+            return {"status": "WORKING", "reason": "not touched", "filled_quantity": Decimal("0")}
+        liquidity = Decimal(str(order.get("available_liquidity", quantity)))
+        filled = min(quantity, liquidity) if order_type == "LIMIT" else quantity
+        if filled <= 0:
+            return {"status": "WORKING", "reason": "no liquidity", "filled_quantity": Decimal("0")}
+        if "market_volume" in order:
+            try:
+                cost_calc.validate_capacity(filled, Decimal(str(order["market_volume"])))
+            except ValueError as exc:
+                return {"status": "REJECTED", "reason": str(exc), "filled_quantity": Decimal("0")}
+        actual_price = cost_calc.apply_slippage_price(price if order_type == "LIMIT" else bar.close, side)
+        cost = cost_calc.compute_trade_cost(filled, actual_price, is_maker=order_type == "LIMIT", side=side)
+        if cost.margin > available_cash:
+            return {"status": "REJECTED", "reason": "insufficient margin", "filled_quantity": Decimal("0")}
+        return {
+            "status": "FILLED" if filled == quantity else "PARTIALLY_FILLED",
+            "filled_quantity": filled, "price": actual_price, "fee": cost.fee,
+            "slippage": cost.slippage, "delay": bar.open_time - requested_at,
+            "remaining_quantity": quantity - filled,
+        }
 
     def _settle_funding(
         self,
@@ -825,7 +1177,11 @@ class EventDrivenBacktestEngine:
             trade_cost = cost_calc.compute_trade_cost(
                 pos.quantity, mark_price, is_maker=False, side=side,
             )
-            cash_delta = pos.margin + pnl - trade_cost.fee - trade_cost.slippage
+            liquidation_cost = cost_calc.compute_liquidation_cost(pos.quantity * mark_price)
+            borrowing = cost_calc.compute_borrowing_cost(
+                pos.quantity * mark_price, self._holding_days(pos.opened_at, bar.open_time),
+            )
+            cash_delta = pos.margin + pnl - trade_cost.fee - trade_cost.slippage - borrowing - liquidation_cost
 
             trades.append(TradeRecord(
                 instrument_id=instrument_id,
@@ -836,8 +1192,10 @@ class EventDrivenBacktestEngine:
                 timestamp=bar.open_time,
                 fee=trade_cost.fee,
                 slippage=trade_cost.slippage,
+                borrowing=borrowing,
                 pnl=pnl,
                 is_liquidation=True,
+                liquidation_cost=liquidation_cost,
             ))
 
             del positions[instrument_id]
@@ -852,6 +1210,12 @@ class EventDrivenBacktestEngine:
         if pos.side == "LONG":
             return (current_price - pos.entry_price) * pos.quantity
         return (pos.entry_price - current_price) * pos.quantity
+
+    @staticmethod
+    def _holding_days(opened_at: datetime, closed_at: datetime) -> Decimal:
+        """Return an exact Decimal day fraction for borrowing cost accrual."""
+        seconds = max(Decimal("0"), Decimal(str((closed_at - opened_at).total_seconds())))
+        return seconds / Decimal("86400")
 
     @staticmethod
     def _compute_unrealized_pnl(
@@ -898,6 +1262,20 @@ class EventDrivenBacktestEngine:
         return "env-unknown"
 
     @staticmethod
+    def _file_hash(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _stable_report_payload(report_card: ReportCard) -> dict[str, Any]:
+        payload = report_card.model_dump(mode="json")
+        payload["run_id"] = None
+        alpha = payload.get("alpha_score")
+        if isinstance(alpha, dict):
+            alpha["run_id"] = None
+            alpha["score_id"] = None
+        return payload
+
+    @staticmethod
     def _save_trades(trades: list[TradeRecord], bt_dir: Path) -> str:
         """保存逐笔交易到 JSONL"""
         path = bt_dir / "trades.jsonl"
@@ -913,6 +1291,8 @@ class EventDrivenBacktestEngine:
                     "fee": str(t.fee),
                     "slippage": str(t.slippage),
                     "funding": str(t.funding),
+                    "borrowing": str(t.borrowing),
+                    "liquidation_cost": str(t.liquidation_cost),
                     "pnl": str(t.pnl),
                     "is_liquidation": t.is_liquidation,
                 }, ensure_ascii=False) + "\n")

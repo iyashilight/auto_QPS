@@ -51,11 +51,16 @@ class TestBuildContainer:
         assert container.event_bus is not None
 
     def test_container_all_ports_registered(self, test_config: Config) -> None:
-        """所有端口已注册（占位实现）"""
+        """所有端口已注册，关键控制面端口使用真实实现。"""
+        from qps.agents.agent_core import DurableAgentGateway
+        from qps.control.lifecycle import LifecycleManager
+        from qps.control.scheduler import TaskScheduler
+
         container = build_container(test_config)
         expected_ports = [
             "data_provider",
             "market_adapter",
+            "market_gateway",
             "exchange_adapter",
             "broker_adapter",
             "feature_pipeline",
@@ -75,13 +80,21 @@ class TestBuildContainer:
         ]
         for name in expected_ports:
             assert container.has_port(name), f"端口 {name} 应已注册"
+        assert isinstance(container.get_port("lifecycle_manager"), LifecycleManager)
+        assert isinstance(container.get_port("scheduler"), TaskScheduler)
+        assert isinstance(container.get_port("agent_gateway"), DurableAgentGateway)
 
     def test_port_not_implemented_raises(self, test_config: Config) -> None:
-        """占位端口调用抛 NotImplementedError"""
+        """生产容器提供安全 Paper Broker，而不是占位端口。"""
+        import asyncio
+
+        from qps.broker.paper import PaperBrokerAdapter
+
         container = build_container(test_config)
         port = container.get_port("broker_adapter")
-        with pytest.raises(NotImplementedError, match="尚未实现"):
-            port.connect()
+        assert isinstance(port, PaperBrokerAdapter)
+        asyncio.run(port.connect())
+        assert port.status().connected is True
 
     def test_get_missing_port_raises(self, test_config: Config) -> None:
         """获取未注册端口抛 KeyError"""
@@ -93,8 +106,10 @@ class TestBuildContainer:
         """列出所有已注册端口"""
         container = build_container(test_config)
         ports = container.list_ports()
-        assert len(ports) == 18
+        assert len(ports) == 22
         assert "data_provider" in ports
+        assert "release_store" in ports
+        assert "research_store" in ports
 
 
 # ── 测试容器 ──────────────────────────────────────────────
@@ -131,7 +146,9 @@ class TestBuildTestContainer:
         """替换端口返回旧实现"""
         container = build_container(test_config)
         old = container.replace_port("broker_adapter", _NotImplementedPort())
-        assert isinstance(old, _NotImplementedPort)
+        from qps.broker.paper import PaperBrokerAdapter
+
+        assert isinstance(old, PaperBrokerAdapter)
 
     def test_register_custom_port(self, test_config: Config) -> None:
         """注册自定义端口"""

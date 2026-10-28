@@ -217,6 +217,8 @@ class TestParseRestKlines:
         assert bar.volume == Decimal("100.000")
         assert bar.trades_count == 500
         assert bar.quality == DataQuality.OK
+        assert bar.available_at is None
+        assert bar.decision_time is None
 
     def test_parse_empty_klines(self) -> None:
         """空响应返回空列表"""
@@ -273,6 +275,8 @@ class TestParseWsKline:
         assert bar.open == Decimal("67000.00")
         assert bar.close == Decimal("67050.00")
         assert bar.trades_count == 500
+        assert bar.available_at is None
+        assert bar.decision_time is None
 
     def test_parse_invalid_ws_kline_returns_none(self) -> None:
         """无效数据返回 None"""

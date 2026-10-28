@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -63,6 +65,12 @@ class IntentBuilder:
         deployment_id: str,
         default_valid_until_seconds: int = 600,
         event_bus: Callable[[dict[str, Any]], None] | None = None,
+        clock: datetime | None = None,
+        allowed_instruments: set[str] | None = None,
+        release_id: str | None = None,
+        interval: str | None = None,
+        deterministic_ids: bool = False,
+        input_snapshot_ref: str | None = None,
     ) -> None:
         """初始化意图构建器
 
@@ -78,6 +86,12 @@ class IntentBuilder:
         self._deployment_id = deployment_id
         self._default_valid_until_seconds = default_valid_until_seconds
         self._event_bus = event_bus
+        self._clock = clock or datetime.now(UTC)
+        self._allowed_instruments = allowed_instruments
+        self._release_id = release_id
+        self._interval = interval
+        self._deterministic_ids = deterministic_ids
+        self._input_snapshot_ref = input_snapshot_ref
 
     def build_and_emit(self, intent: dict[str, Any]) -> EventEnvelope:
         """构建并发出意图
@@ -108,6 +122,8 @@ class IntentBuilder:
 
         # 6. 校验 reason_tags 格式
         self._validate_reason_tags(intent)
+        if self._allowed_instruments is not None and intent.get("instrument_id") not in self._allowed_instruments:
+            raise IntentValidationError("标的不在 Release 允许范围", field="instrument_id")
 
         # 7. 补全字段
         completed = self._complete_intent(intent)
@@ -227,17 +243,22 @@ class IntentBuilder:
 
     def _complete_intent(self, intent: dict[str, Any]) -> dict[str, Any]:
         """补全意图字段"""
+        stable = hashlib.sha256(json.dumps(intent, sort_keys=True, default=str).encode()).hexdigest()[:16]
         completed = {
-            "intent_id": str(uuid.uuid4()),
+            "intent_id": f"intent-{stable}" if self._deterministic_ids else str(uuid.uuid4()),
             "strategy_id": self._strategy_id,
             "version_no": self._version_no,
             "deployment_id": self._deployment_id,
             **intent,
         }
+        if self._release_id is not None:
+            completed["release_id"] = self._release_id
+        if self._interval is not None:
+            completed["interval"] = self._interval
 
         # 补全 valid_until
         if "valid_until" not in completed:
-            now = datetime.now(UTC)
+            now = self._clock
             completed["valid_until"] = (now + timedelta(seconds=self._default_valid_until_seconds)).isoformat()
 
         # 补全默认值
@@ -254,11 +275,20 @@ class IntentBuilder:
 
     def _create_event(self, intent: dict[str, Any]) -> EventEnvelope:
         """创建 INTENT_CREATED 事件"""
+        event_material: dict[str, Any] = {"intent": intent}
+        if self._input_snapshot_ref is not None:
+            event_material["input_snapshot_ref"] = self._input_snapshot_ref
+            event_material["release_id"] = self._release_id
+        stable = hashlib.sha256(json.dumps(event_material, ensure_ascii=False, sort_keys=True,
+                                           separators=(",", ":"), default=str).encode()).hexdigest()[:8]
+        occurred_at = self._clock
         return EventEnvelope(
-            event_id=make_event_id(uuid.uuid4().hex[:8]),
+            event_id=make_event_id(stable if self._deterministic_ids else uuid.uuid4().hex[:8]),
             event_type=EventType.INTENT_CREATED,
             schema_version=1,
-            ts=datetime.now(UTC).isoformat(),
+            ts=occurred_at.isoformat(),
+            occurred_at=occurred_at,
+            recorded_at=occurred_at,
             source=f"strategy_runtime.{self._strategy_id}",
             payload={"intent": intent},
         )

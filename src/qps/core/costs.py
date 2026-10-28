@@ -21,13 +21,15 @@ class TradeCost:
     fee: Decimal = Decimal("0")  # 手续费
     slippage: Decimal = Decimal("0")  # 滑点成本
     funding: Decimal = Decimal("0")  # 资金费率成本
+    borrowing: Decimal = Decimal("0")  # 借贷成本
+    liquidation: Decimal = Decimal("0")  # 强平费用
     notional: Decimal = Decimal("0")  # 名义价值
     margin: Decimal = Decimal("0")  # 所需保证金
 
     @property
     def total(self) -> Decimal:
         """总成本"""
-        return self.fee + self.slippage + self.funding
+        return self.fee + self.slippage + self.funding + self.borrowing + self.liquidation
 
 
 class CostCalculator:
@@ -219,6 +221,17 @@ class CostCalculator:
         if side == "LONG":
             return funding  # 正费率时为正（支付），负费率时为负（收取）
         return -funding  # 正费率时为负（收取），负费率时为正（支付）
+
+    def compute_borrowing_cost(self, notional: Decimal, duration: Decimal) -> Decimal:
+        """按名义价值和持仓时间（天）计借贷成本。"""
+        return notional * self._config.borrowing_rate * duration
+
+    def compute_liquidation_cost(self, notional: Decimal) -> Decimal:
+        return notional * self._config.liquidation_fee_rate
+
+    def validate_capacity(self, quantity: Decimal, market_volume: Decimal) -> None:
+        if market_volume < 0 or quantity > market_volume * self._config.capacity_participation_rate:
+            raise ValueError("订单超过容量参与上限")
 
     def compute_trade_cost(
         self,

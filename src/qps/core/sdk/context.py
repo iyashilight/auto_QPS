@@ -5,8 +5,12 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import logging
-from datetime import UTC, datetime
+import math
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -17,6 +21,32 @@ if TYPE_CHECKING:
 if TYPE_CHECKING:
     from qps.core.models.account import Position
     from qps.core.models.market import Bar
+
+
+class FormalFeatureReader:
+    """Synchronous SDK adapter around a verified formal PIT feature port."""
+
+    is_formal = True
+
+    def __init__(self, port: Any, *, manifest_id: str, start: datetime, end: datetime) -> None:
+        if not manifest_id or start >= end:
+            raise ValueError("formal feature reader 必须绑定 manifest 和有效范围")
+        if start.tzinfo is None or start.utcoffset() != timedelta(0) or end.tzinfo is None or end.utcoffset() != timedelta(0):
+            raise ValueError("formal feature reader 时间必须是 UTC")
+        self._port = port
+        self.manifest_id = manifest_id
+        self._start = start
+        self._end = end
+
+    def query_features(self, instrument_id: str, names: list[str], *, decision_time: datetime,
+                       interval: str) -> dict[str, float]:
+        result = self._port.query_features(instrument_id, names, self._start, self._end,
+            decision_time=decision_time, manifest_id=self.manifest_id)
+        if hasattr(result, "__await__"):
+            raise ValueError("formal feature reader 不得在同步策略回调中阻塞异步 PIT port")
+        return {str(item.feature_name): float(item.value) for item in result
+                if getattr(item, "instrument_id", None) == instrument_id
+                and getattr(item, "decision_time", decision_time) <= decision_time}
 
 
 class MarketRegimeView:
@@ -122,9 +152,15 @@ class StrategyContext:
         params: dict[str, Any],
         instruments: list[str],
         interval: str,
+        release_id: str | None = None,
+        decision_time: datetime | None = None,
+        input_snapshot_ref: str | None = None,
+        clock: Callable[[], datetime] | None = None,
+        feature_reader: Any = None,
         feature_pipeline: Callable[..., dict[str, float]] | None = None,
         event_bus: Callable[[dict[str, Any]], None] | None = None,
         default_valid_until_seconds: int = 600,
+        strict: bool = False,
     ) -> None:
         """初始化策略上下文
 
@@ -142,10 +178,21 @@ class StrategyContext:
         self._strategy_id = strategy_id
         self._version_no = version_no
         self._deployment_id = deployment_id
-        self._params = params
-        self._instruments = instruments
+        self._params = copy.deepcopy(params)
+        self._instruments = tuple(instruments)
+        self._release_id = release_id
+        self._input_snapshot_ref = input_snapshot_ref
         self._interval = interval
+        if strict:
+            if not release_id or decision_time is None or not input_snapshot_ref:
+                raise ValueError("正式 StrategyContext 必须绑定 release_id、decision_time 和 input_snapshot_ref")
+            if feature_pipeline is not None:
+                raise ValueError("正式 StrategyContext 禁止 legacy feature callback")
+            if feature_reader is None or not getattr(feature_reader, "is_formal", False):
+                raise ValueError("正式 StrategyContext 必须绑定 formal PIT feature reader")
+        self._strict = strict
         self._feature_pipeline = feature_pipeline
+        self._feature_reader = feature_reader
         self._event_bus = event_bus
         self._default_valid_until_seconds = default_valid_until_seconds
 
@@ -159,7 +206,23 @@ class StrategyContext:
         self._log_buffer: list[dict[str, Any]] = []
 
         # 时间管理
-        self._current_time: datetime | None = None
+        self._current_time: datetime | None = decision_time
+        self._clock = clock or (lambda: datetime.now(UTC))
+        if decision_time is not None and (decision_time.tzinfo is None or decision_time.utcoffset() != timedelta(0)):
+            raise ValueError("decision_time 必须是 UTC aware datetime")
+
+    @classmethod
+    def for_runtime(cls, *, strategy_id: str, version_no: int, deployment_id: str,
+                    release_id: str, params: dict[str, Any], instruments: list[str], interval: str,
+                    decision_time: datetime, input_snapshot_ref: str,
+                    clock: Callable[[], datetime] | None = None,
+                    feature_reader: Any = None,
+                    event_bus: Callable[[dict[str, Any]], None] | None = None) -> StrategyContext:
+        """Construct the only context entry point available to formal Runtime."""
+        return cls(strategy_id=strategy_id, version_no=version_no, deployment_id=deployment_id,
+            release_id=release_id, params=params, instruments=instruments, interval=interval,
+            decision_time=decision_time, input_snapshot_ref=input_snapshot_ref, clock=clock, feature_reader=feature_reader,
+            event_bus=event_bus, strict=True)
 
     # ── 参数访问 ──────────────────────────────────────────
 
@@ -170,7 +233,7 @@ class StrategyContext:
         返回 MappingProxyType，修改会抛 TypeError。
         策略侧 ctx.params.get(...) 仍可用（MappingProxyType 兼容 Mapping 接口）。
         """
-        return MappingProxyType(self._params)
+        return MappingProxyType(copy.deepcopy(self._params))
 
     @property
     def strategy_id(self) -> str:
@@ -183,6 +246,20 @@ class StrategyContext:
         return self._version_no
 
     @property
+    def release_id(self) -> str | None:
+        return self._release_id
+
+    @property
+    def input_snapshot_ref(self) -> str | None:
+        return self._input_snapshot_ref
+
+    @property
+    def decision_time(self) -> datetime:
+        if self._current_time is None:
+            raise ValueError("formal Context 尚未绑定 decision_time")
+        return self._current_time
+
+    @property
     def deployment_id(self) -> str:
         """部署实例 ID"""
         return self._deployment_id
@@ -190,7 +267,7 @@ class StrategyContext:
     @property
     def instruments(self) -> list[str]:
         """标的列表"""
-        return self._instruments
+        return list(self._instruments)
 
     @property
     def interval(self) -> str:
@@ -240,6 +317,14 @@ class StrategyContext:
         - 缓存未命中（返回空）时按"特征暂不可用"处理
         - 策略应跳过本轮信号，不得用空值/零值继续计算
         """
+        if self._strict and self._feature_reader is not None:
+            try:
+                result = self._feature_reader.query_features(
+                    instrument_id, [name], decision_time=self.decision_time, interval=self._interval,
+                )
+                return result.get(name) if name in result else None
+            except Exception as exc:
+                raise ValueError(f"PIT feature query failed: {exc}") from exc
         if self._feature_pipeline is None:
             return None
 
@@ -248,7 +333,9 @@ class StrategyContext:
             if result and name in result:
                 return result[name]
             return None
-        except Exception:
+        except Exception as exc:
+            if self._strict:
+                raise ValueError(f"PIT feature query failed: {exc}") from exc
             return None
 
     def features(self, instrument_id: str, names: list[str]) -> dict[str, float]:
@@ -261,13 +348,23 @@ class StrategyContext:
         Returns:
             {feature_name: value}，缺失的特征不包含在结果中
         """
+        if self._strict and self._feature_reader is not None:
+            try:
+                result = self._feature_reader.query_features(
+                    instrument_id, names, decision_time=self.decision_time, interval=self._interval,
+                )
+                return {key: value for key, value in result.items() if key in names}
+            except Exception as exc:
+                raise ValueError(f"PIT feature query failed: {exc}") from exc
         if self._feature_pipeline is None:
             return {}
 
         try:
             result = self._feature_pipeline(instrument_id, names)
             return {k: v for k, v in result.items() if k in names}
-        except Exception:
+        except Exception as exc:
+            if self._strict:
+                raise ValueError(f"PIT feature query failed: {exc}") from exc
             return {}
 
     # ── 市场状态 ──────────────────────────────────────────
@@ -315,6 +412,39 @@ class StrategyContext:
         """保存当前状态（用于持久化）"""
         return dict(self._state)
 
+    def state_snapshot(self) -> dict[str, Any]:
+        """Return a stable, auditable state snapshot without changing the SDK state API."""
+        try:
+            normalized = self._canonical_state(self._state)
+            encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"state 不是稳定 JSON: {exc}") from exc
+        return {"schema_version": 1, "state_version": 1, "release_id": self._release_id,
+                "deployment_id": self._deployment_id, "input_snapshot_ref": "",
+                "previous_state_hash": "", "state": copy.deepcopy(json.loads(encoded)),
+                "state_hash": hashlib.sha256(encoded.encode()).hexdigest(), "intent_hash": "",
+                "event_hash": ""}
+
+    @classmethod
+    def _canonical_state(cls, value: object) -> object:
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, Decimal):
+            return {"$decimal": str(value)}
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() != timedelta(0):
+                raise ValueError("state datetime 必须是 UTC")
+            return {"$datetime": value.isoformat()}
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("state 禁止 NaN/Infinity")
+            return value
+        if isinstance(value, dict):
+            return {str(key): cls._canonical_state(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+        if isinstance(value, (list, tuple)):
+            return [cls._canonical_state(item) for item in value]
+        raise TypeError(f"state 不允许的类型: {type(value).__name__}")
+
     def restore_state(self, state: dict[str, Any]) -> None:
         """恢复状态（用于重启恢复）"""
         self._state.clear()
@@ -322,7 +452,7 @@ class StrategyContext:
 
     # ── 意图输出 ──────────────────────────────────────────
 
-    def emit_intent(self, intent: dict[str, Any]) -> None:
+    def emit_intent(self, intent: dict[str, Any]) -> Any:
         """输出交易意图（唯一输出通道）
 
         Args:
@@ -341,8 +471,26 @@ class StrategyContext:
             deployment_id=self._deployment_id,
             default_valid_until_seconds=self._default_valid_until_seconds,
             event_bus=self._event_bus,
+            clock=self.current_time,
+            allowed_instruments=set(self._instruments) if self._release_id else None,
+            release_id=self._release_id,
+            interval=self._interval,
+            deterministic_ids=self._release_id is not None,
+            input_snapshot_ref=self._input_snapshot_ref,
         )
-        builder.build_and_emit(intent)
+        event = builder.build_and_emit(intent)
+        if not hasattr(self, "_emitted_events"):
+            self._emitted_events: list[Any] = []
+        self._emitted_events.append(event)
+        return event
+
+    def emitted_events(self) -> tuple[Any, ...]:
+        """Return formal events emitted during the current callback."""
+        return tuple(getattr(self, "_emitted_events", ()))
+
+    def clear_emitted_events(self) -> None:
+        if hasattr(self, "_emitted_events"):
+            self._emitted_events.clear()
 
     # ── 日志 ──────────────────────────────────────────────
 
@@ -377,11 +525,15 @@ class StrategyContext:
 
     def set_current_time(self, time: datetime) -> None:
         """设置当前时间（由框架调用，回测时注入）"""
+        if time.tzinfo is None or time.utcoffset() != timedelta(0):
+            raise ValueError("current_time 必须是 UTC aware datetime")
+        if self._strict and self._current_time is not None and time != self._current_time:
+            raise ValueError("formal Context 的 decision_time 不能被策略推进")
         self._current_time = time
 
     @property
-    def current_time(self) -> datetime | None:
+    def current_time(self) -> datetime:
         """当前时间（回测时由框架注入，实盘时为系统时间）"""
         if self._current_time is not None:
             return self._current_time
-        return datetime.now(UTC)
+        return self._clock()

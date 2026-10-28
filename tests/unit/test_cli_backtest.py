@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 if TYPE_CHECKING:
@@ -108,6 +109,37 @@ def _build_cli_container(tmp_path: Path, bars: list[Bar] | None = None) -> Magic
 class TestCLIBacktest:
     """CLI backtest 端到端"""
 
+    def test_backtest_requires_manifest_and_utc_decision_time(self) -> None:
+        missing = runner.invoke(app, ["research", "backtest", "test_strat"])
+        assert missing.exit_code == 2
+        assert "manifest-id" in missing.output
+
+        non_utc = runner.invoke(app, [
+            "research", "backtest", "test_strat",
+            "--manifest-id", "manifest-test", "--decision-time", "2026-01-01T08:00:00+08:00",
+        ])
+        assert non_utc.exit_code == 2
+        assert "UTC" in non_utc.output
+
+    @pytest.mark.parametrize(
+        "range_value",
+        [
+            "2026-01-01T00:00:00:2026-01-02T00:00:00Z",
+            "2026-01-01T08:00:00+08:00:2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z:2026-01-01T00:00:00Z",
+        ],
+    )
+    def test_backtest_range_rejects_invalid_utc_before_container(self, range_value: str) -> None:
+        with patch("qps.di.build_container") as build_container:
+            result = runner.invoke(app, [
+                "research", "backtest", "test_strat",
+                "--manifest-id", "manifest-test", "--decision-time", "2026-01-01T00:00:00Z",
+                "--range", range_value,
+            ])
+        assert result.exit_code == 2
+        assert "range" in result.output
+        build_container.assert_not_called()
+
     def test_backtest_run(self, tmp_path: Path) -> None:
         """qps research backtest 成功执行"""
         bars = _make_bars_sequence(datetime(2026, 1, 1, tzinfo=UTC), 30)
@@ -116,7 +148,8 @@ class TestCLIBacktest:
         with patch("qps.di.build_container", return_value=mock_container):
             result = runner.invoke(app, [
                 "research", "backtest", "test_strat",
-                "--range", "2026-01-01:2026-01-31",
+                "--manifest-id", "manifest-test", "--decision-time", "2026-01-01T00:00:00+00:00",
+                "--range", "2026-01-01T00:00:00Z:2026-01-31T00:00:00Z",
                 "--json",
             ])
 
@@ -133,8 +166,9 @@ class TestCLIBacktest:
         with patch("qps.di.build_container", return_value=mock_container):
             result = runner.invoke(app, [
                 "research", "backtest", "test_strat",
+                "--manifest-id", "manifest-test", "--decision-time", "2026-01-01T00:00:00+00:00",
                 "--cost-config", '{"maker_fee": "0.05", "taker_fee": "0.06"}',
-                "--range", "2026-01-01:2026-01-31",
+                "--range", "2026-01-01T00:00:00Z:2026-01-31T00:00:00Z",
                 "--json",
             ])
 
@@ -186,7 +220,8 @@ class TestCLIExperiment:
         with patch("qps.di.build_container", return_value=mock_container):
             bt_result = runner.invoke(app, [
                 "research", "backtest", "test_strat",
-                "--range", "2026-01-01:2026-01-31",
+                "--manifest-id", "manifest-test", "--decision-time", "2026-01-01T00:00:00+00:00",
+                "--range", "2026-01-01T00:00:00Z:2026-01-31T00:00:00Z",
                 "--json",
             ])
         assert bt_result.exit_code == 0, f"回测失败: {bt_result.output}"
@@ -213,7 +248,8 @@ class TestCLIExperiment:
         with patch("qps.di.build_container", return_value=mock_container):
             bt1_result = runner.invoke(app, [
                 "research", "backtest", "test_strat",
-                "--range", "2026-01-01:2026-01-31",
+                "--manifest-id", "manifest-test", "--decision-time", "2026-01-01T00:00:00+00:00",
+                "--range", "2026-01-01T00:00:00Z:2026-01-31T00:00:00Z",
                 "--json",
             ])
         assert bt1_result.exit_code == 0, f"回测1失败: {bt1_result.output}"
@@ -223,8 +259,9 @@ class TestCLIExperiment:
         with patch("qps.di.build_container", return_value=mock_container):
             bt2_result = runner.invoke(app, [
                 "research", "backtest", "test_strat",
+                "--manifest-id", "manifest-test", "--decision-time", "2026-01-01T00:00:00+00:00",
                 "--params", '{"entry_z": 1.5, "position_size": "0.2"}',
-                "--range", "2026-01-01:2026-01-31",
+                "--range", "2026-01-01T00:00:00Z:2026-01-31T00:00:00Z",
                 "--json",
             ])
         assert bt2_result.exit_code == 0, f"回测2失败: {bt2_result.output}"
@@ -253,7 +290,8 @@ class TestCLIExperiment:
         with patch("qps.di.build_container", return_value=mock_container):
             bt_result = runner.invoke(app, [
                 "research", "backtest", "test_strat",
-                "--range", "2026-01-01:2026-01-31",
+                "--manifest-id", "manifest-test", "--decision-time", "2026-01-01T00:00:00+00:00",
+                "--range", "2026-01-01T00:00:00Z:2026-01-31T00:00:00Z",
                 "--json",
             ])
         assert bt_result.exit_code == 0, f"回测失败: {bt_result.output}"

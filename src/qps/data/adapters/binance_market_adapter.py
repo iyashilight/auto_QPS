@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from qps.core.constants import DataQuality
 from qps.core.errors import BrokerBusinessError, BrokerNetworkError
@@ -555,6 +555,10 @@ class BinanceMarketAdapter:
                     trades_count=int(item[8]),
                     data_version=self._data_version,
                     quality=DataQuality.OK,
+                    # Binance kline payloads have exchange event/close times but
+                    # no auditable source visibility time. Keep PIT metadata
+                    # unknown until the ingestion pipeline assigns a policy.
+                    raw_payload=cast("Any", item),
                 )
                 bars.append(bar)
             except Exception:
@@ -604,6 +608,9 @@ class BinanceMarketAdapter:
                 trades_count=int(k.get("n", 0)),
                 data_version=self._data_version,
                 quality=DataQuality.OK,
+                # Binance does not expose when this payload became visible to
+                # the collector, so this adapter cannot produce a PIT Bar.
+                raw_payload=cast("Any", data),
             )
         except Exception:
             logger.exception("解析 WS K 线数据失败")

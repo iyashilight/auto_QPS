@@ -1,1 +1,5 @@
-"""调度器（骨架，M4 阶段实现）"""
+"""Control-plane compatibility entry point for the durable scheduler."""
+
+from qps.infra.tasks import TaskQueue, TaskScheduler
+
+__all__ = ["TaskQueue", "TaskScheduler"]

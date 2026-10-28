@@ -1,1 +1,1 @@
-"""Agent 网关与占位实现（M6 阶段实现）"""
+"""Offline Agent gateway, durable TaskRun/Artifact storage and Draft-only research."""

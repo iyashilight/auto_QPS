@@ -125,6 +125,8 @@ class TrendBreakout(BaseStrategy):
 
 ## 4. StrategyContext 能力表
 
+v0.5 M2 的 Context 可绑定 `release_id`、`strategy_instance_id`、UTC `decision_time` 和固定 clock。显式 Release 绑定时，instrument/interval 由框架注入并校验；策略不得自行替换研究输入。`state_snapshot()` 产生带 schema/version 和 state hash 的稳定 JSON 快照，提交和恢复由框架控制。
+
 | 能力 | 签名（形态） | 说明 |
 | --- | --- | --- |
 | 参数 | `ctx.params -> dict` | 当前部署的参数快照（不可变） |
@@ -242,3 +244,11 @@ class TrendBreakout(BaseStrategy):
 ---
 
 *本文件为策略 SDK 基线；字段与回调新增必须同步更新 03 文档对应端口。*
+# M2 v0.5 Formal SDK Boundary
+
+正式 SDK 入口为 `StrategyContext.for_runtime()` 和 `FormalStrategyExecutor`。Context 必须绑定 Release、deployment、固定 UTC decision time、input snapshot reference 和 formal materialized input；策略不能注入任意 feature callback 或推进时间。`emit_intent()` 唯一调用 `IntentBuilder`，父进程还会按同一白名单和 deterministic lineage 重新验证。
+
+Runtime 与正式回测的 input 必须由 Factory 的 trusted materialization 调用图产生，策略、Runtime 调用方和
+回测 driver 都不能提交 bar、feature map、available_at 或 manifest/hash 作为替代输入。Context 只读取
+已经过 source-row provenance 验证的当前 snapshot；伪造或无法由 immutable PIT source 重导的 artifact
+必须在进入 Context 前失败。

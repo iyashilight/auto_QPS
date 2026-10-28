@@ -116,6 +116,8 @@ class VectorizedBacktestEngine:
             "cost_config": original.engine_config.get("cost_config", {}),
             "leverage": original.engine_config.get("leverage", "3"),
             "random_seed": original.engine_config.get("random_seed", 42),
+            "manifest_id": original.engine_config.get("manifest_id"),
+            "decision_time": original.engine_config.get("decision_time"),
         }
 
         return await self.run(request)
@@ -133,16 +135,24 @@ class VectorizedBacktestEngine:
         - 成本使用共享 CostCalculator
         - 不做强平/资金费率结算（粗筛阶段简化）
         """
+        formal_pit = getattr(self._container, "_research_requires_pit", False) is True
+        if formal_pit:
+            raise BacktestError(detail="正式 PIT 回测只能使用 EventDriven FormalStrategyExecutor，禁止 Vectorized 绕过 Release")
         data_provider = self._get_data_provider()
+        pit_manifest_id = req.manifest_id if req.manifest_id is not None else ""
+        pit_decision_time = req.decision_time if req.decision_time is not None else req.start
         all_bars: dict[str, list[Bar]] = {}
         for instrument_id in req.instruments:
-            bars = await data_provider.get_bars(
-                instrument_id=instrument_id,
-                interval=req.interval,
-                start=req.start,
-                end=req.end,
-                data_version=req.data_version,
-            )
+            if formal_pit:
+                bars = await data_provider.query(
+                    instrument_id, req.start, req.end,
+                    decision_time=pit_decision_time, manifest_id=pit_manifest_id,
+                )
+            else:
+                bars = await data_provider.get_bars(
+                    instrument_id=instrument_id, interval=req.interval,
+                    start=req.start, end=req.end, data_version=req.data_version,
+                )
             all_bars[instrument_id] = bars
 
         total_bars = sum(len(b) for b in all_bars.values())
@@ -245,6 +255,8 @@ class VectorizedBacktestEngine:
         # 构建 BacktestRun
         engine_config = {
             "engine_mode": "VECTORIZED",
+            "formal": False,
+            "non_formal_reason": "vectorized diagnostic path cannot generate EvidenceReport",
             "fill_timing": "BAR_CLOSE",
             "signal_source": "builtin",
             "instruments": req.instruments,
@@ -252,6 +264,8 @@ class VectorizedBacktestEngine:
             "cost_config": req.cost_config.model_dump(),
             "leverage": str(req.leverage),
             "random_seed": req.random_seed,
+            "manifest_id": req.manifest_id,
+            "decision_time": req.decision_time.isoformat() if req.decision_time else None,
             "trades_ref": str(trades_ref),
             "equity_curve_ref": str(equity_ref),
         }

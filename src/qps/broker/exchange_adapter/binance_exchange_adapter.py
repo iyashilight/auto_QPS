@@ -291,12 +291,8 @@ class BinanceExchangeAdapter:
         )
 
         try:
-            # 校准服务器时间（失败不阻塞连接）
-            try:
-                await self._calibrate_server_time()
-            except Exception as e:
-                logger.warning("服务器时间校准失败，将使用本地时间: %s", e)
-                self._server_time_offset = 0.0
+            # 时间校准是数据真实性前提；失败时保持未连接，不能用 offset=0 冒充成功。
+            await self._calibrate_server_time()
             self._connected = True
             logger.info(
                 "Binance Exchange Adapter 已连接: spot=%s, futures=%s (testnet=%s)",
@@ -569,11 +565,11 @@ class BinanceExchangeAdapter:
                 cause=e,
             ) from e
         except httpx.HTTPStatusError as e:
-            logger.warning("服务器时间校准 HTTP 错误: %s，将使用本地时间", e)
-            self._server_time_offset = 0.0
+            raise BrokerNetworkError(detail="服务器时间校准 HTTP 失败", cause=e) from e
         except Exception as e:
-            logger.warning("服务器时间校准失败: %s，将使用本地时间", e)
-            self._server_time_offset = 0.0
+            if isinstance(e, BrokerNetworkError):
+                raise
+            raise BrokerNetworkError(detail="服务器时间校准失败", cause=e) from e
 
     async def _send_request(
         self,

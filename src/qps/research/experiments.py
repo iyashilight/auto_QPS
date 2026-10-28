@@ -27,7 +27,9 @@ from qps.core.models.experiment import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from qps.core.models.foundation import TrialEvent, TrialRegistration
     from qps.infra.storage.meta_db import MetaDB
+    from qps.infra.storage.research_db import ResearchStore
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,10 @@ class ExperimentStore:
                     run.created_at.isoformat(),
                 ),
             )
+
+    async def append(self, run: BacktestRun | OptimizationRun) -> None:
+        """Append a run through the historical ExperimentStore contract."""
+        await self.create_run(run)
 
     async def get_run(self, run_id: str) -> BacktestRun | OptimizationRun:
         """获取实验记录"""
@@ -281,7 +287,7 @@ class ExperimentStore:
         )
 
     async def save_report_card(self, report_card: ReportCard) -> None:
-        """保存报告卡到 report_cards 表"""
+        """保存报告卡到 report_cards 表，不允许原地替换历史结果。"""
         metrics_json = json.dumps(
             report_card.metrics.model_dump() if report_card.metrics else {},
             default=_json_default,
@@ -297,20 +303,42 @@ class ExperimentStore:
         )
 
         with self._meta_db.transaction() as conn:
+            existing = conn.execute(
+                "SELECT strategy_id, version_no, metrics, gate_results, alpha_score, conclusion "
+                "FROM report_cards WHERE run_id = ?",
+                (report_card.run_id,),
+            ).fetchone()
+            values = (
+                report_card.strategy_id,
+                report_card.version_no,
+                metrics_json,
+                gate_results_json,
+                alpha_score_json,
+                report_card.conclusion,
+            )
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise DataError(detail=f"report card 内容冲突，历史记录不可覆盖: {report_card.run_id}")
+                return
             conn.execute(
-                """INSERT OR REPLACE INTO report_cards
+                """INSERT INTO report_cards
                    (run_id, strategy_id, version_no, metrics, gate_results, alpha_score, conclusion)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    report_card.run_id,
-                    report_card.strategy_id,
-                    report_card.version_no,
-                    metrics_json,
-                    gate_results_json,
-                    alpha_score_json,
-                    report_card.conclusion,
-                ),
+                (report_card.run_id, *values),
             )
+
+
+class TrialRegistry:
+    """M3 trial registry facade backed by the append-only research store."""
+
+    def __init__(self, store: ResearchStore) -> None:
+        self._store = store
+
+    def append(self, registration: TrialRegistration) -> None:
+        self._store.append_registration(registration)
+
+    def append_event(self, event: TrialEvent) -> None:
+        self._store.append_trial_event(event)
 
 
 def _json_default(obj: Any) -> Any:

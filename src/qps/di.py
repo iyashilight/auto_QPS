@@ -27,8 +27,12 @@ class Container:
         self._app_config = app_config
         self._event_bus = EventBus()
         self._meta_db: MetaDB | None = None
+        # Production research paths must opt into the immutable PIT contract.
+        self._research_requires_pit = False
+        self._formal_research_active = False
 
-        # 端口实现占位：本阶段不实现业务逻辑
+        # All cross-module implementations are registered by build_container;
+        # test code may replace them explicitly through replace_port().
         self._ports: dict[str, Any] = {}
 
     @property
@@ -122,10 +126,11 @@ def build_container(config: Config) -> Container:
         config: 已加载的 Config 实例
 
     Returns:
-        Container 实例（端口为占位实现）
+        Container 实例（Paper/离线安全默认端口）
     """
     app_config = validate_config(config.raw_data)
     container = Container(config, app_config)
+    container._research_requires_pit = True
 
     # ── 初始化元数据库（建表 + insert-only 约束）──
     container.meta_db.initialize()
@@ -162,6 +167,19 @@ def build_container(config: Config) -> Container:
 
     market_adapter = BinanceMarketAdapter(exchange_adapter=exchange_adapter)
     container.register_port("market_adapter", market_adapter)
+    from qps.trading.gateway import MarketDataGateway
+
+    container.register_port("market_gateway", MarketDataGateway(market_adapter))
+
+    # ── M1: Data Provider ─────────────────────────────────
+    from qps.data.manifest import ManifestStore, PersistentFeatureRegistry
+    from qps.data.provider import DataProvider
+
+    data_provider = DataProvider(config.data_dir, meta_db=container.meta_db, allow_legacy=False)
+    container.register_port("data_provider", data_provider)
+
+    manifest_store = ManifestStore(config.data_dir, container.meta_db)
+    feature_registry = PersistentFeatureRegistry(container.meta_db, manifest_store)
 
     # ── M1: Feature Pipeline ──────────────────────────────
     from qps.data.features.engine import FeatureEngine, register_mvp_features
@@ -169,21 +187,21 @@ def build_container(config: Config) -> Container:
     feature_engine = FeatureEngine(
         features_dir=config.data_dir / "features",
         data_version="binance-default",
+        data_port=data_provider,
+        registry_port=feature_registry,
+        manifest_store=manifest_store,
+        allow_legacy_compute=False,
     )
     register_mvp_features(feature_engine)
     container.register_port("feature_pipeline", feature_engine)
 
-    # ── M1: Data Provider ─────────────────────────────────
-    from qps.data.provider import DataProvider
-
-    data_provider = DataProvider(config.data_dir)
-    container.register_port("data_provider", data_provider)
-
     # ── M3: Backtest Engine & Optimizer & Experiment Store ──
+    from qps.infra.storage.research_db import ResearchStore
     from qps.research.backtest.event_driven import EventDrivenBacktestEngine
     from qps.research.experiments import ExperimentStore
     from qps.research.optimizer.engine import Optimizer
     from qps.research.registry import StrategyRegistry
+    from qps.research.release import ReleaseStore
 
     backtest_engine = EventDrivenBacktestEngine(container)
     container.register_port("backtest_engine", backtest_engine)
@@ -193,6 +211,7 @@ def build_container(config: Config) -> Container:
         data_dir=config.data_dir,
     )
     container.register_port("experiment_store", experiment_store)
+    container.register_port("research_store", ResearchStore(config.data_dir / "research.db"))
 
     optimizer = Optimizer(container)
     container.register_port("optimizer", optimizer)
@@ -200,21 +219,81 @@ def build_container(config: Config) -> Container:
     # M3.4: 接线策略注册表（回测引擎按 strategy_id+version_no 加载真实策略代码）
     strategy_registry = StrategyRegistry(config.data_dir / "meta.db")
     container.register_port("strategy_registry", strategy_registry)
+    release_store = ReleaseStore(
+        config.data_dir / "meta.db", config.data_dir / "releases",
+    )
+    container.register_port("release_store", release_store)
 
-    _port_names = [
-        "broker_adapter",
-        "lifecycle_manager",
-        "signal_engine",
-        "portfolio_manager",
-        "risk_engine",
-        "execution_engine",
-        "strategy_runtime",
-        "monitoring",
-        "scheduler",
-        "agent_gateway",
-    ]
-    for name in _port_names:
-        container.register_port(name, _NotImplementedPort())
+    # ── M4--M6: durable Paper trading port graph ──────────
+    # The default graph is Paper and starts frozen.  Live credentials and
+    # network side effects are never introduced by DI construction.
+    from qps.broker.paper import PaperBrokerAdapter
+    from qps.control.lifecycle import LifecycleManager
+    from qps.control.scheduler import TaskScheduler
+    from qps.core.sdk.formal import FormalDecisionInputFactory
+    from qps.data.formal_materializer import FormalDecisionMaterializer
+    from qps.infra.storage.trading_journal import JournalDB
+    from qps.trading.kernel import CapitalPolicyService, TradingLifecycle
+    from qps.trading.port_adapters import (
+        ExecutionEngineAdapter,
+        MonitoringAdapter,
+        PortfolioManagerAdapter,
+        RiskEngineAdapter,
+        SignalEngineAdapter,
+    )
+    from qps.trading.runtime.process_runtime import IsolatedStrategyRuntime
+    from qps.trading.runtime.state import StateStore
+
+    journal = JournalDB(config.data_dir / "trading.db")
+    journal.initialize()
+    paper_broker = PaperBrokerAdapter(account_id="paper")
+    lifecycle = TradingLifecycle("paper")
+    capital_policy = CapitalPolicyService({
+        "capital_envelope_by_strategy": {
+            "single": str(app_config.risk.account.max_total_notional),
+        },
+        "instrument_limits": {},
+    })
+    signal_engine = SignalEngineAdapter()
+    portfolio_manager = PortfolioManagerAdapter(config.data_dir / "trading.db")
+    risk_engine = RiskEngineAdapter(
+        max_single_notional=app_config.risk.order.max_single_notional,
+        max_total_notional=app_config.risk.account.max_total_notional,
+    )
+    execution_engine = ExecutionEngineAdapter(
+        journal, paper_broker, lifecycle=lifecycle, policy=capital_policy,
+    )
+    monitoring = MonitoringAdapter(config.data_dir / "monitoring.jsonl")
+
+    materializer = FormalDecisionMaterializer(
+        data_port=data_provider,
+        manifest_store=manifest_store,
+        feature_registry=feature_registry,
+    )
+    input_factory = FormalDecisionInputFactory(
+        config.data_dir / "decision_inputs", materializer=materializer,
+    )
+    strategy_runtime = IsolatedStrategyRuntime(
+        release_store,
+        state_store=StateStore(config.data_dir / "runtime-state.db"),
+        input_factory=input_factory,
+        require_os_isolation=True,
+    )
+
+    container.register_port("lifecycle_manager", LifecycleManager(container.meta_db, container.event_bus))
+    container.register_port("scheduler", TaskScheduler(container.meta_db, container.event_bus))
+    container.register_port("broker_adapter", paper_broker)
+    container.register_port("signal_engine", signal_engine)
+    container.register_port("portfolio_manager", portfolio_manager)
+    container.register_port("risk_engine", risk_engine)
+    container.register_port("execution_engine", execution_engine)
+    container.register_port("strategy_runtime", strategy_runtime)
+    container.register_port("monitoring", monitoring)
+    container.register_port("trading_lifecycle", lifecycle)
+
+    from qps.agents.agent_core import DurableAgentGateway
+
+    container.register_port("agent_gateway", DurableAgentGateway(config.data_dir / "agent.db"))
 
     return container
 
@@ -248,6 +327,7 @@ def build_test_container(
         config = Config(config_dir=cfg_dir, env_vars={})
 
     container = build_container(config)
+    container._research_requires_pit = False
 
     # 应用端口覆盖
     if port_overrides:

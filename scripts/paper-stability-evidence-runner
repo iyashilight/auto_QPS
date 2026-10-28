@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Verify ADR-019 Paper stability evidence without accepting test fixtures."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from qps.trading.paper_evidence import (
+    EvidenceLineage,
+    PaperEvidenceCollector,
+    PaperEvidenceError,
+    PaperEvidenceImporter,
+    PaperEvidenceIncompleteError,
+    PaperEvidenceStore,
+    PaperReadinessEvaluator,
+)
+
+
+def _fixture(*, daily: bool) -> int:
+    with TemporaryDirectory() as directory:
+        seed = bytes(range(32))
+        fingerprint = hashlib.sha256(PaperEvidenceCollector.__module__.encode()).hexdigest()
+        # Build the lineage fingerprint from the collector key, not a caller value.
+        from qps.trading.paper_evidence import _public
+        fingerprint = hashlib.sha256(_public(seed)).hexdigest()
+        store = PaperEvidenceStore(Path(directory) / "journal.db")
+        lineage = EvidenceLineage("dep", "release", "policy", "paper", store.journal_id, fingerprint)
+        collector = PaperEvidenceCollector(store, lineage, seed, boot_id="fixture", real_window=False)
+        now = datetime.now(UTC)
+        collector.append_observation(recorded_at=now, monotonic_ns=1, input_snapshot_ref="input", intent_event_hash="intent", outcome_ref="outcome")
+        if daily:
+            collector.append_daily_attestation(
+                day=now.date(),
+                reconciliation={
+                    "status": "MATCHED",
+                    "orders_hash": "orders",
+                    "fills_hash": "fills",
+                    "positions_hash": "positions",
+                    "balances_hash": "balances",
+                    "funding_hash": "funding",
+                    "ledger_residual_hash": "0",
+                },
+                incidents=[],
+                recorded_at=now,
+                monotonic_ns=2,
+            )
+        importer = PaperEvidenceImporter(PaperEvidenceStore(Path(directory) / "import.db", journal_id=store.journal_id), lineage, collector.public_key)
+        importer.import_records(store.records())
+        if daily:
+            print(json.dumps({"status": "passed", "records": len(store.records())}, sort_keys=True))
+        else:
+            print(json.dumps({"status": "passed", "lineage": lineage.as_dict()}, sort_keys=True))
+    return 0
+
+
+def verify(journal: Path, deployment: str, fingerprint: str) -> int:
+    if deployment == "user-provided" or fingerprint == "user-provided":
+        raise PaperEvidenceIncompleteError("real Paper host, journal and signer fingerprint were not provided")
+    store = PaperEvidenceStore(journal)
+    records = store.records()
+    if not records:
+        raise PaperEvidenceIncompleteError("no imported Paper evidence")
+    lineage = EvidenceLineage(**records[0]["lineage"])
+    if lineage.deployment_id != deployment or lineage.signer_fingerprint != fingerprint:
+        raise PaperEvidenceError("requested lineage does not match journal")
+    public_key = bytes.fromhex(str(records[0].get("signer_public_key", "")))
+    with TemporaryDirectory() as directory:
+        verified_store = PaperEvidenceStore(Path(directory) / "verified.db", journal_id=store.journal_id)
+        PaperEvidenceImporter(verified_store, lineage, public_key).import_records(records)
+        report = PaperReadinessEvaluator().evaluate_verified_window(verified_store.records(), deployment_id=deployment, public_key_fingerprint=fingerprint)
+    store.append_report(report)
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("verify-fixture-lineage")
+    sub.add_parser("verify-fixture-daily-operations")
+    verify_parser = sub.add_parser("verify")
+    verify_parser.add_argument("--journal", required=True, type=Path)
+    verify_parser.add_argument("--deployment", required=True)
+    verify_parser.add_argument("--public-key-fingerprint", required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == "verify-fixture-lineage":
+            return _fixture(daily=False)
+        if args.command == "verify-fixture-daily-operations":
+            return _fixture(daily=True)
+        return verify(args.journal, args.deployment, args.public_key_fingerprint)
+    except PaperEvidenceIncompleteError as exc:
+        print(json.dumps({"status": "blocked", "reason": str(exc)}, sort_keys=True))
+        return 77
+    except (PaperEvidenceError, OSError, ValueError) as exc:
+        print(json.dumps({"status": "failed", "reason": str(exc)}, sort_keys=True), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

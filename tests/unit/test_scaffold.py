@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import pytest
 
+from qps.core.sdk import StrategyContext
 from qps.research.scaffold import TEMPLATES, StrategyScaffold
 
 if TYPE_CHECKING:
@@ -44,6 +48,14 @@ class TestTemplates:
         grid = TEMPLATES["grid"]
         assert "grid_spacing" in grid["params_schema"]["properties"]
         assert "grid_count" in grid["params_schema"]["properties"]
+
+    @pytest.mark.parametrize("template", ["trend", "mean_reversion", "grid"])
+    def test_templates_are_executable_not_placeholder(self, template: str) -> None:
+        """模板必须包含可执行回调，而不是 pass/TODO 空壳。"""
+        source = TEMPLATES[template]["code_template"]
+        assert "pass" not in source
+        assert "TODO" not in source
+        assert "emit_intent" in source
 
 
 class TestScaffoldCreate:
@@ -189,6 +201,72 @@ class TestGeneratedTestsRun:
         content = test_file.read_text()
         assert "test_initialize" in content
         assert "test_on_bar" in content
+
+    @pytest.mark.parametrize("template", ["trend", "mean_reversion", "grid"])
+    def test_generated_template_executes_signal_path(self, tmp_path: Path, template: str) -> None:
+        """每个生成模板至少能在确定性输入下走过真实回调。"""
+        strategy_id = f"generated_{template}"
+        scaffold = StrategyScaffold(tmp_path)
+        strategy_dir = scaffold.create(strategy_id, template=template)
+        sys.path.insert(0, str(strategy_dir.parent))
+        try:
+            importlib.invalidate_caches()
+            strategy_type = importlib.import_module(f"{strategy_id}.strategy").Strategy
+            params = {
+                "lookback": 2,
+                "atr_mult": 2.0,
+                "entry_z": 2.0,
+                "exit_z": 0.5,
+                "grid_spacing": 0.01,
+                "grid_count": 5,
+                "position_size": 0.1,
+            }
+            ctx = StrategyContext(
+                strategy_id=strategy_id,
+                version_no=1,
+                deployment_id="dep_generated",
+                params=params,
+                instruments=["BTC-USDT-PERP"],
+                interval="5m",
+                feature_pipeline=lambda _instrument, names: {
+                    name: (0.1 if name == "returns" else 0.01)
+                    for name in names
+                },
+            )
+            strategy = strategy_type()
+            strategy.initialize(ctx)
+            start = datetime(2026, 1, 1, tzinfo=UTC)
+            bars = [
+                _scaffold_bar(100, start),
+                _scaffold_bar(100, start + timedelta(minutes=5)),
+                _scaffold_bar(102 if template == "grid" else 120, start + timedelta(minutes=10)),
+            ]
+            for bar in bars:
+                ctx.set_latest_bar(bar.instrument_id, bar)
+                strategy.on_bar(ctx, bar)
+            assert hasattr(ctx, "emitted_events")
+            if template in {"trend", "grid"}:
+                assert ctx.emitted_events()
+        finally:
+            sys.path.remove(str(strategy_dir.parent))
+
+
+def _scaffold_bar(close: int, open_time: datetime):
+    from qps.core.models import Bar
+
+    value = Decimal(str(close))
+    return Bar(
+        instrument_id="BTC-USDT-PERP",
+        open_time=open_time,
+        interval="5m",
+        open=value,
+        high=value + Decimal("1"),
+        low=value - Decimal("1"),
+        close=value,
+        volume=Decimal("100"),
+        quote_volume=Decimal("10000"),
+        data_version="scaffold-test",
+    )
 
 
 class TestScaffoldSandboxCheck:

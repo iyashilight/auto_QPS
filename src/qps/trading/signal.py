@@ -1,1 +1,7 @@
-"""Signal Engine（骨架，M4 阶段实现）"""
+"""Signal Engine public entry point."""
+
+from qps.trading.port_adapters import SignalEngineAdapter
+
+SignalEngine = SignalEngineAdapter
+
+__all__ = ["SignalEngine", "SignalEngineAdapter"]

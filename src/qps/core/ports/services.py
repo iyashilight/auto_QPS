@@ -117,10 +117,10 @@ class SchedulerPort(Protocol):
 
 @runtime_checkable
 class AgentGatewayPort(Protocol):
-    """Agent 网关端口（M6 占位）
+    """Agent 网关端口（M7 离线研究增强）
 
     语义要点：
-    - M6 实现，MVP 提供本地 handler 占位
+    - M7 实现，提供持久化本地 handler
     - Agent 产出 Artifact 不可变，默认只影响 Draft 状态
     """
 

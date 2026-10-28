@@ -60,6 +60,8 @@ class Optimizer:
         Returns:
             OptimizationRun（含 best_params 和 best_metrics）
         """
+        if request.get("formal") or request.get("trial_id") or request.get("reservation_id"):
+            raise BacktestError(detail="optimizer 不是 formal research 入口；请使用 ResearchRunService")
         req = self._parse_request(request)
         run_id = self._generate_run_id(req)
 
@@ -615,3 +617,45 @@ class Optimizer:
         if isinstance(port, ExperimentStore):
             return port
         raise BacktestError(detail="experiment_store 端口未实现")
+
+
+class FormalOptimizerAdapter:
+    """将候选生成器接到 v2 ResearchRunService；不直接调用 legacy engine。"""
+
+    def __init__(self, research_service: Any) -> None:
+        self.service = research_service
+
+    async def search(
+        self, *, registration: Any, candidate: Any, actor_type: Any,
+        candidates: list[dict[str, Any]], release_id: str,
+        reserved_at: datetime, requested_compute: Decimal,
+        request_factory: Any,
+    ) -> tuple[dict[str, Any], ...]:
+        if not candidates:
+            raise BacktestError(detail="formal optimizer 至少需要一个 candidate")
+        results: list[dict[str, Any]] = []
+        for index, params in enumerate(candidates):
+            trial_id = f"{registration.trial_id}:candidate:{index}"
+            encoded = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+            candidate_i = candidate.model_copy(update={
+                "candidate_id": trial_id,
+                "candidate_fingerprint": hashlib.sha256(encoded.encode()).hexdigest(),
+                "parameter_structure_hash": hashlib.sha256(
+                    json.dumps(sorted(params), separators=(",", ":")).encode()
+                ).hexdigest(),
+            })
+            registration_i = registration.model_copy(update={
+                "trial_id": trial_id, "parameter_space": params,
+            })
+            try:
+                run = await self.service.register_and_reserve_trial(
+                    registration=registration_i, candidate=candidate_i,
+                    actor_type=actor_type, requested_compute=requested_compute,
+                    blind_reveals=0, reserved_at=reserved_at,
+                    frozen_release_id=release_id,
+                    request=request_factory(params),
+                )
+                results.append({"trial_id": trial_id, "status": "SUCCEEDED", "run_id": getattr(run, "run_id", None)})
+            except Exception as exc:
+                results.append({"trial_id": trial_id, "status": "FAILED", "failure_reason": str(exc)[:500]})
+        return tuple(results)

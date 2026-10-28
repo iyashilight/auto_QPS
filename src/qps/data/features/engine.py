@@ -11,19 +11,33 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
+import shutil
+import tempfile
+from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from qps.core.errors import DataError
+from qps.core.models.foundation import (
+    FeatureDefinition,
+    FeatureMaterialization,
+    FrozenStringMap,
+    SourceReference,
+)
 from qps.core.models.market import Bar, FeatureSet
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import datetime
-    from pathlib import Path
+
+    from qps.core.ports.v05 import FeatureRegistryPort, PointInTimeDataPort
+    from qps.data.manifest import ManifestStore
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +365,10 @@ class FeatureEngine:
         self,
         features_dir: Path | None = None,
         data_version: str = "unknown",
+        data_port: PointInTimeDataPort | None = None,
+        registry_port: FeatureRegistryPort | None = None,
+        manifest_store: ManifestStore | None = None,
+        allow_legacy_compute: bool = True,
     ) -> None:
         """初始化 Feature Engine
 
@@ -363,6 +381,10 @@ class FeatureEngine:
         self._features_dir = features_dir
         self._data_version = data_version
         self._cache: dict[str, dict[str, float]] = {}  # instrument_id → {feature_name: value}
+        self._data_port = data_port
+        self._registry_port = registry_port
+        self._manifest_store = manifest_store
+        self._allow_legacy_compute = allow_legacy_compute
 
     # ── FeaturePipelinePort 接口实现 ──────────────────────
 
@@ -390,6 +412,9 @@ class FeatureEngine:
         feature_names: list[str],
         start: datetime,
         end: datetime,
+        *,
+        decision_time: datetime,
+        manifest_id: str,
     ) -> list[FeatureSet]:
         """批量计算特征
 
@@ -406,11 +431,14 @@ class FeatureEngine:
         Raises:
             DataError: 特征未注册
         """
-        # 注意：实际使用时需要从 DataProvider 获取 bars
-        # 这里是计算引擎本身，bars 由外部传入
-        # 此方法在 CLI 层获取 bars 后调用 _compute_features
-        raise NotImplementedError(
-            "compute() 需要外部传入 bars 数据，请使用 compute_with_bars()"
+        if self._data_port is None:
+            raise DataError(detail="FeatureEngine 未配置 PointInTimeDataPort")
+        bars = await self._data_port.query(
+            instrument_id, start, end, decision_time=decision_time, manifest_id=manifest_id
+        )
+        return self._compute_with_bars(
+            instrument_id, interval, feature_names, bars, check_mode="strict",
+            source_manifest_id=manifest_id, decision_time=decision_time,
         )
 
     def compute_with_bars(
@@ -420,6 +448,23 @@ class FeatureEngine:
         feature_names: list[str],
         bars: list[Bar],
         check_mode: str = "structural",
+    ) -> list[FeatureSet]:
+        """Legacy/test-only computation entry; production instances reject it."""
+        if not self._allow_legacy_compute:
+            raise DataError(detail="正式 FeatureEngine 禁止 compute_with_bars；必须从 PIT manifest compute")
+        return self._compute_with_bars(
+            instrument_id, interval, feature_names, bars, check_mode=check_mode,
+        )
+
+    def _compute_with_bars(
+        self,
+        instrument_id: str,
+        interval: str,
+        feature_names: list[str],
+        bars: list[Bar],
+        check_mode: str = "structural",
+        source_manifest_id: str | None = None,
+        decision_time: datetime | None = None,
     ) -> list[FeatureSet]:
         """基于 K 线数据计算特征
 
@@ -475,6 +520,11 @@ class FeatureEngine:
                         value=Decimal(str(round(values[i], 8))),
                         feature_version=feature_version,
                         data_version=self._data_version,
+                        available_at=bar.available_at,
+                        source_manifest_id=source_manifest_id,
+                        # A backfilled materialization must retain the point at
+                        # which this row became usable, not the later batch run.
+                        decision_time=bar.available_at or decision_time,
                     )
                     all_features.append(fs)
 
@@ -520,6 +570,7 @@ class FeatureEngine:
         feature_version: str,
         interval: str,
         instrument_id: str,
+        output_root: Path | None = None,
     ) -> Path | None:
         """写入特征数据到 Parquet
 
@@ -534,13 +585,19 @@ class FeatureEngine:
         """
         if not features or self._features_dir is None:
             return None
+        if not self._allow_legacy_compute and any(
+            feature.source_manifest_id is None or feature.decision_time is None
+            for feature in features
+        ):
+            raise DataError(detail="正式 FeatureEngine 输出必须绑定 source_manifest_id 和 decision_time")
 
         import polars as pl
 
         # 使用 instrument_id 中的符号部分
         symbol_dir = instrument_id.split("-", 1)[-1] if "-" in instrument_id else instrument_id
 
-        out_dir = self._features_dir / feature_version / interval / symbol_dir
+        root = output_root or self._features_dir
+        out_dir = root / feature_version / interval / symbol_dir
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # 按年分片
@@ -551,8 +608,6 @@ class FeatureEngine:
 
         last_path: Path | None = None
         for year, year_features in sorted(by_year.items()):
-            out_path = out_dir / f"{year}.parquet"
-
             rows = [
                 {
                     "instrument_id": fs.instrument_id,
@@ -561,14 +616,142 @@ class FeatureEngine:
                     "value": str(fs.value),
                     "feature_version": fs.feature_version,
                     "data_version": fs.data_version,
+                    "available_at": fs.available_at.isoformat() if fs.available_at else None,
+                    "source_manifest_id": fs.source_manifest_id,
+                    "decision_time": fs.decision_time.isoformat() if fs.decision_time else None,
                 }
                 for fs in year_features
             ]
+            content = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:24]
+            out_path = out_dir / f"{year}-{digest}.parquet"
+
             df = pl.DataFrame(rows)
-            df.write_parquet(out_path)
+            if not out_path.exists():
+                df.write_parquet(out_path)
             last_path = out_path
 
         return last_path
+
+    async def materialize(
+        self,
+        instrument_id: str,
+        interval: str,
+        feature_names: list[str],
+        start: datetime,
+        end: datetime,
+        *,
+        decision_time: datetime,
+        input_manifest_id: str,
+        definition_version: int = 1,
+    ) -> FeatureMaterialization:
+        """Compute from a PIT manifest and persist output lineage atomically at the registry boundary."""
+        for value, field in ((start, "start"), (end, "end"), (decision_time, "decision_time")):
+            if value.tzinfo is None or value.utcoffset() != timedelta(0):
+                raise DataError(detail=f"{field} 必须是 UTC 时间")
+        if start >= end:
+            raise DataError(detail="start 必须早于 end")
+        if self._manifest_store is None or self._registry_port is None:
+            raise DataError(detail="FeatureEngine 未配置 manifest store / FeatureRegistryPort")
+        input_manifest = self._manifest_store.get(input_manifest_id)
+        self._manifest_store.verify_pit_manifest(
+            input_manifest,
+            expected_dataset_types={"normalized.bars", "bars", "feature_input.bars"},
+            instrument_id=instrument_id, interval=interval, start=start, end=end,
+            require_formal=True,
+        )
+        features = await self.compute(
+            instrument_id, interval, feature_names, start, end,
+            decision_time=decision_time, manifest_id=input_manifest.manifest_id,
+        )
+        if not features:
+            raise DataError(detail="PIT 查询没有可物化的特征值")
+
+        if self._features_dir is None:
+            raise DataError(detail="FeatureEngine 未配置 features_dir")
+
+        self._features_dir.mkdir(parents=True, exist_ok=True)
+        temp_root = Path(tempfile.mkdtemp(prefix=".materialize-", dir=self._features_dir))
+        created_paths: list[Path] = []
+        final_paths: list[Path] = []
+        quality_report_path: Path | None = None
+        quality_report_preexisting = False
+        try:
+            for version in sorted({feature.feature_version for feature in features}):
+                selected = [feature for feature in features if feature.feature_version == version]
+                path = self.write_features(selected, version, interval, instrument_id, output_root=temp_root)
+                if path is not None:
+                    relative = path.relative_to(temp_root)
+                    final_path = self._features_dir / relative
+                    final_path.parent.mkdir(parents=True, exist_ok=True)
+                    if final_path.exists():
+                        if final_path.read_bytes() != path.read_bytes():
+                            raise DataError(detail=f"不可变 feature 输出冲突: {final_path}")
+                    else:
+                        os.replace(path, final_path)
+                        created_paths.append(final_path)
+                    final_paths.append(final_path)
+            if not final_paths:
+                raise DataError(detail="特征输出未写入")
+
+            output_sources = (
+                *input_manifest.source_refs,
+                SourceReference(name="input-manifest", reference=input_manifest.manifest_id),
+            )
+            candidate_manifest = self._manifest_store.build(
+                "features", [str(path) for path in final_paths], output_sources, persist=False,
+            )
+            quality_report_path = self._features_dir.parent / f"quality_reports/{candidate_manifest.manifest_id}.json"
+            quality_report_preexisting = quality_report_path.exists()
+            quality_ref = self._manifest_store.write_quality_report(
+                candidate_manifest,
+                {
+                    "instrument_id": instrument_id,
+                    "interval": interval,
+                    "overall_quality": "OK",
+                    "source_manifest_id": input_manifest.manifest_id,
+                },
+            )
+            output_manifest = self._manifest_store.build_formal_pit(
+                "features", [str(path) for path in final_paths], output_sources,
+                instrument_id=instrument_id, interval=interval, quality_report_ref=quality_ref,
+                persist=False,
+            )
+            used_names = sorted({feature.feature_name for feature in features})
+            definitions: list[FeatureDefinition] = []
+            for name in used_names:
+                registration = self._registry.get_latest(name)
+                definitions.append(FeatureDefinition(
+                    feature_id=name, semantic_name=name,
+                    description=f"FeatureEngine {name}", formula_or_code_hash=registration.version,
+                    input_schema=FrozenStringMap({"dataset_type": input_manifest.dataset_type}),
+                    source_types=(input_manifest.dataset_type,), window=registration.input_window,
+                    warmup=max(0, registration.input_window - 1), frequency=interval,
+                    available_at_rule="input_pit", owner="FeatureEngine", version=definition_version,
+                    created_at=decision_time,
+                ))
+            output_hash = output_manifest.content_hash
+            materializations = [FeatureMaterialization(
+                materialization_id=f"materialization-{name}-{output_hash[:20]}",
+                feature_id=name, feature_version=definition_version,
+                input_manifest_ids=(input_manifest.manifest_id,),
+                output_manifest_id=output_manifest.manifest_id, coverage=Decimal("1"),
+                quality_report_id="feature-engine-v0.5", computed_at=decision_time,
+                content_hash=output_hash,
+            ) for name in used_names]
+            batch_method = getattr(self._registry_port, "register_materialization_batch", None)
+            if batch_method is None:
+                raise DataError(detail="FeatureRegistryPort 不支持原子 multi-feature materialization")
+            await batch_method(definitions, output_manifest, materializations)
+            return materializations[0]
+        except Exception:
+            for path in created_paths:
+                path.unlink(missing_ok=True)
+            if quality_report_path is not None and not quality_report_preexisting:
+                quality_report_path.unlink(missing_ok=True)
+            raise
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
 
     # ── 内部计算方法 ──────────────────────────────────────
 

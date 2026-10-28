@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -156,9 +157,10 @@ class RawWriter:
                     # 按 interval + open_time 去重，保留最新的
                     merged = pl.concat([existing_df, new_df])
                     merged = merged.sort(["interval", "open_time"]).unique(subset=["interval", "open_time"], keep="last")
-                    merged.write_parquet(existing_file)
-                    written_files.append(existing_file)
-                    logger.debug("追加 Raw K 线: %s (%d bars)", existing_file, len(merged))
+                    target = self._revision_path(partition_dir, batch_id)
+                    merged.write_parquet(target)
+                    written_files.append(target)
+                    logger.debug("追加 Raw K 线: %s (%d bars)", target, len(merged))
                     continue
                 # overwrite 模式继续执行
 
@@ -166,9 +168,10 @@ class RawWriter:
             df = self._bars_to_dataframe(day_bars, data_version)
 
             # 写入 Parquet
-            df.write_parquet(existing_file)
-            written_files.append(existing_file)
-            logger.debug("写入 Raw K 线: %s (%d bars)", existing_file, len(day_bars))
+            target = existing_file if not existing_file.exists() else self._revision_path(partition_dir, batch_id)
+            df.write_parquet(target)
+            written_files.append(target)
+            logger.debug("写入 Raw K 线: %s (%d bars)", target, len(day_bars))
 
         return written_files
 
@@ -230,9 +233,10 @@ class RawWriter:
                     new_df = pl.DataFrame(new_rows)
                     merged = pl.concat([existing_df, new_df])
                     merged = merged.sort("funding_ts").unique(subset=["funding_ts"], keep="last")
-                    merged.write_parquet(existing_file)
-                    written_files.append(existing_file)
-                    logger.debug("合并 Raw 资金费率: %s (%d rates)", existing_file, len(merged))
+                    target = self._revision_path(partition_dir, batch_id)
+                    merged.write_parquet(target)
+                    written_files.append(target)
+                    logger.debug("合并 Raw 资金费率: %s (%d rates)", target, len(merged))
                     continue
                 # overwrite 模式继续执行
 
@@ -248,9 +252,10 @@ class RawWriter:
                 for r in day_rates
             ]
             df = pl.DataFrame(rows)
-            df.write_parquet(existing_file)
-            written_files.append(existing_file)
-            logger.debug("写入 Raw 资金费率: %s (%d rates)", existing_file, len(day_rates))
+            target = existing_file if not existing_file.exists() else self._revision_path(partition_dir, batch_id)
+            df.write_parquet(target)
+            written_files.append(target)
+            logger.debug("写入 Raw 资金费率: %s (%d rates)", target, len(day_rates))
 
         return written_files
 
@@ -312,9 +317,10 @@ class RawWriter:
                     new_df = pl.DataFrame(new_rows)
                     merged = pl.concat([existing_df, new_df])
                     merged = merged.sort("ts").unique(subset=["ts"], keep="last")
-                    merged.write_parquet(existing_file)
-                    written_files.append(existing_file)
-                    logger.debug("合并 Raw OI: %s (%d records)", existing_file, len(merged))
+                    target = self._revision_path(partition_dir, batch_id)
+                    merged.write_parquet(target)
+                    written_files.append(target)
+                    logger.debug("合并 Raw OI: %s (%d records)", target, len(merged))
                     continue
                 # overwrite 模式继续执行
 
@@ -330,14 +336,14 @@ class RawWriter:
                 for o in day_oi
             ]
             df = pl.DataFrame(rows)
-            df.write_parquet(existing_file)
-            written_files.append(existing_file)
-            logger.debug("写入 Raw OI: %s (%d records)", existing_file, len(day_oi))
+            target = existing_file if not existing_file.exists() else self._revision_path(partition_dir, batch_id)
+            df.write_parquet(target)
+            written_files.append(target)
+            logger.debug("写入 Raw OI: %s (%d records)", target, len(day_oi))
 
         return written_files
 
-    @staticmethod
-    def _bars_to_dataframe(bars: list[Bar], data_version: str) -> pl.DataFrame:
+    def _bars_to_dataframe(self, bars: list[Bar], data_version: str) -> pl.DataFrame:
         """将 Bar 列表转为 Polars DataFrame"""
         rows = [
             {
@@ -354,10 +360,34 @@ class RawWriter:
                 "trades_count": bar.trades_count,
                 "data_version": data_version,
                 "quality": bar.quality.value,
+                "event_time": bar.event_time.isoformat() if bar.event_time else None,
+                "available_at": bar.available_at.isoformat() if bar.available_at else None,
+                "ingested_at": bar.ingested_at.isoformat() if bar.ingested_at else None,
+                "close_time": bar.close_time.isoformat() if bar.close_time else None,
+                "is_closed": bar.is_closed,
+                "source": self._source,
+                "batch_id": data_version,
+                "request_id": data_version,
+                "source_event_time": bar.event_time.isoformat() if bar.event_time else bar.open_time.isoformat(),
+                "raw_payload": json.dumps(
+                    bar.raw_payload if bar.raw_payload is not None else bar.model_dump(mode="json"),
+                    ensure_ascii=False, sort_keys=True,
+                ),
             }
             for bar in bars
         ]
         return pl.DataFrame(rows)
+
+    @staticmethod
+    def _revision_path(partition_dir: Path, batch_id: str) -> Path:
+        """Return a new immutable revision path for an already existing partition."""
+        digest = hashlib.sha256(batch_id.encode("utf-8")).hexdigest()[:20]
+        candidate = partition_dir / f"part-{digest}.parquet"
+        suffix = 1
+        while candidate.exists():
+            candidate = partition_dir / f"part-{digest}-{suffix}.parquet"
+            suffix += 1
+        return candidate
 
     @staticmethod
     def _make_data_version(batch_id: str) -> str:
@@ -478,6 +508,12 @@ class Normalizer:
                 trades_count=bar.trades_count,
                 data_version=bar.data_version,
                 quality=quality,
+                event_time=bar.event_time,
+                available_at=bar.available_at,
+                ingested_at=bar.ingested_at,
+                close_time=bar.close_time,
+                is_closed=bar.is_closed,
+                decision_time=bar.decision_time,
             )
             normalized.append(normalized_bar)
             prev_close = bar.close
@@ -546,6 +582,16 @@ class Normalizer:
                         "trades_count": bar.trades_count,
                         "data_version": bar.data_version,
                         "quality": bar.quality.value,
+                        "event_time": bar.event_time.isoformat() if bar.event_time else None,
+                        "available_at": bar.available_at.isoformat() if bar.available_at else None,
+                        "ingested_at": bar.ingested_at.isoformat() if bar.ingested_at else None,
+                        "close_time": bar.close_time.isoformat() if bar.close_time else None,
+                        "is_closed": bar.is_closed,
+                        "raw_lineage": bar.data_version,
+                        "raw_payload": json.dumps(
+                            bar.raw_payload if bar.raw_payload is not None else bar.model_dump(mode="json"),
+                            ensure_ascii=False, sort_keys=True,
+                        ),
                     }
                     for bar in year_bars
                 ]
@@ -553,9 +599,10 @@ class Normalizer:
                 # 按 open_time 去重，保留最新的（通过 data_version 判断）
                 merged = pl.concat([existing_df, new_df])
                 merged = merged.sort("open_time").unique(subset=["open_time"], keep="last")
-                merged.write_parquet(out_path)
-                last_path = out_path
-                logger.debug("合并 Normalized K 线: %s (%d bars)", out_path, len(merged))
+                target = self._revision_path(out_dir, year, year_bars)
+                merged.write_parquet(target)
+                last_path = target
+                logger.debug("合并 Normalized K 线: %s (%d bars)", target, len(merged))
             else:
                 # 覆盖或追加模式
                 rows = [
@@ -573,6 +620,16 @@ class Normalizer:
                         "trades_count": bar.trades_count,
                         "data_version": bar.data_version,
                         "quality": bar.quality.value,
+                        "event_time": bar.event_time.isoformat() if bar.event_time else None,
+                        "available_at": bar.available_at.isoformat() if bar.available_at else None,
+                        "ingested_at": bar.ingested_at.isoformat() if bar.ingested_at else None,
+                        "close_time": bar.close_time.isoformat() if bar.close_time else None,
+                        "is_closed": bar.is_closed,
+                        "raw_lineage": bar.data_version,
+                        "raw_payload": json.dumps(
+                            bar.raw_payload if bar.raw_payload is not None else bar.model_dump(mode="json"),
+                            ensure_ascii=False, sort_keys=True,
+                        ),
                     }
                     for bar in year_bars
                 ]
@@ -582,13 +639,27 @@ class Normalizer:
                     existing_df = pl.read_parquet(out_path)
                     df = pl.concat([existing_df, df])
                     df = df.sort("open_time").unique(subset=["open_time"], keep="last")
-                df.write_parquet(out_path)
-                last_path = out_path
-                logger.debug("写入 Normalized K 线: %s (%d bars)", out_path, len(year_bars))
+                target = out_path if not out_path.exists() else self._revision_path(out_dir, year, year_bars)
+                df.write_parquet(target)
+                last_path = target
+                logger.debug("写入 Normalized K 线: %s (%d bars)", target, len(year_bars))
 
         if last_path is None:
             raise DataError(detail="无数据可写入")
         return last_path
+
+    @staticmethod
+    def _revision_path(out_dir: Path, year: int, bars: list[Bar]) -> Path:
+        payload = "|".join(
+            f"{bar.open_time.isoformat()}:{bar.data_version}:{bar.close}" for bar in bars
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+        path = out_dir / f"{year}-{digest}.parquet"
+        suffix = 1
+        while path.exists():
+            path = out_dir / f"{year}-{digest}-{suffix}.parquet"
+            suffix += 1
+        return path
 
     @staticmethod
     def _detect_gaps(bars: list[Bar], interval: str) -> list[tuple[datetime, datetime]]:

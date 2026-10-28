@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 
 def validate_utc_datetime(v: datetime) -> datetime:
@@ -17,13 +17,15 @@ def validate_utc_datetime(v: datetime) -> datetime:
         def _validate_ts_timezone(cls, v: datetime) -> datetime:
             return validate_utc_datetime(v)
     """
-    if v.tzinfo is None:
+    if v.tzinfo is None or v.utcoffset() is None:
         raise ValueError("必须带时区信息（UTC）")
+    if v.utcoffset() != UTC.utcoffset(v):
+        raise ValueError("时间必须使用 UTC 时区")
     return v
 
 
 def validate_optional_utc_datetime(v: datetime | None) -> datetime | None:
     """验证可选 datetime：非 None 时必须带时区信息（UTC）"""
-    if v is not None and v.tzinfo is None:
-        raise ValueError("必须带时区信息（UTC）")
+    if v is not None:
+        return validate_utc_datetime(v)
     return v
