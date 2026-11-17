@@ -37,3 +37,8 @@ uv run mypy src/qps/
 | `QPS_LOG_LEVEL` | 日志级别覆盖 |
 
 密钥只走环境变量，禁止明文入库。
+
+## License
+
+本项目基于 [GPL-3.0](LICENSE) 发布。
+
